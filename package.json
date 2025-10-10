@@ -1,0 +1,20 @@
+{
+  "name": "webnn-test",
+  "version": "1.0.0",
+  "description": "WebNN automation tests using Playwright",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:wpt": "playwright test --project=chromium-canary -- --suite=wpt",
+    "test:sample": "playwright test --project=chromium-canary -- --suite=sample",
+    "test:preview": "playwright test --project=chromium-canary -- --suite=preview",
+    "report": "start report/index.html",
+    "report-static": "start report/index.html"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0"
+  },
+  "keywords": ["webnn", "playwright", "automation", "testing"],
+  "author": "",
+  "license": "MIT"
+}
