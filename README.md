@@ -7,7 +7,7 @@ This project contains automated tests for WebNN (Web Neural Network) using Playw
 1. **Chrome Canary**: Install Chrome Canary browser
 2. **Node.js**: Install Node.js (version 16 or higher)
 3. **Playwright**: Will be installed via npm
-4. Install Windows App SDK 
+4. Install Windows App SDK
 https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads#experimental-release
 5. Install IHV specific EPs
 6. In powershell with admin priviledge, run DumpPackages.ps1 and search for WindowsMLRuntime
@@ -55,6 +55,14 @@ node src/test.js --suite wpt --wpt-case abs,add,arg_min
 # Run with --ep flag to check ONNX Runtime DLLs
 node src/test.js --suite wpt --wpt-case abs --ep
 node src/test.js --suite wpt,sample --wpt-case abs --ep
+
+# Run with parallel execution (use multiple jobs)
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 4
+
+# Resume from where you left off (if tests were interrupted)
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --resume
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
 ```
 
 ### Method 2: Using npm scripts
@@ -100,7 +108,7 @@ Use suite-specific case options to run only tests that partially match the case 
 node src/test.js --suite wpt --wpt-case abs
 # This will run: abs.html?gpu
 
-# Run only WPT tests containing "arg" in the name  
+# Run only WPT tests containing "arg" in the name
 node src/test.js --suite wpt --wpt-case arg
 # This will run: arg_min_max.html?gpu, etc.
 
@@ -120,6 +128,63 @@ node src/test.js --suite wpt,sample --wpt-case abs --ep
 ```
 
 The case selection is case-insensitive and matches any part of the test filename.
+
+## Parallel Execution
+
+Run multiple tests in parallel to speed up execution:
+
+```bash
+# Run with 2 parallel jobs
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+
+# Run with 4 parallel jobs
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 4
+
+# The more jobs, the faster the execution (up to your CPU cores)
+node src/test.js --suite wpt --jobs 8
+```
+
+**Benefits:**
+- Significantly faster test execution
+- Wall time vs sum of individual test times shows speedup
+- Each test runs in isolated browser context
+
+## Resume Functionality
+
+If your test run is interrupted or quits in an unfinished state, you can resume from where you left off:
+
+```bash
+# First run (might be interrupted)
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+
+# Resume from the last completed test
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
+
+# Works with both sequential and parallel execution
+node src/test.js --suite wpt --wpt-case abs --resume
+```
+
+**How it works:**
+- Progress is automatically saved after each test completes
+- Checkpoint files are stored in `.checkpoint/` directory
+- Use `--resume` flag to skip already completed tests
+- Without `--resume`, tests start fresh (checkpoint is cleared)
+- Each test case combination gets its own checkpoint file
+
+**Example:**
+```bash
+# Start a test run with 10 tests
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+
+# Press Ctrl+C after 5 tests complete
+
+# Resume and continue from test 6
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
+# Output: "🔄 RESUME MODE: Found 5 completed test(s)"
+#         "▶️  Resuming with 5 remaining test(s)"
+```
+
+**Note:** Checkpoint files are specific to the test case combination. Changing `--wpt-case` will use a different checkpoint file.
 
 ## Configuration
 

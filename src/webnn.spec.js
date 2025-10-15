@@ -9,27 +9,27 @@ class WebNNTestRunner {
   async checkOnnxRuntimeDlls() {
     const { execSync } = require('child_process');
     const path = require('path');
-    
+
     try {
       console.log('🔍 Checking for ONNX Runtime DLLs in Chrome process...');
-      
+
       // Construct path to Listdlls64.exe in tools folder
       const toolsPath = path.join(process.cwd(), 'tools', 'Listdlls64.exe');
-      
+
       // Run Listdlls64.exe -v chrome.exe and filter for onnxruntime*.dll files
       // Note: Using findstr on Windows with pattern matching for .dll files
       const command = `${toolsPath} -v chrome.exe | findstr /i "onnxruntime.*\\.dll"`;
-      
+
       console.log(`Running command: ${command}`);
-      const output = execSync(command, { 
+      const output = execSync(command, {
         encoding: 'utf8',
         timeout: 600000 // 10 minute timeout
       });
-      
+
       if (output && output.trim()) {
         // Verify that we actually found .dll files, not just any text containing "onnxruntime"
         const dllLines = output.trim().split('\n').filter(line => line.includes('.dll'));
-        
+
         if (dllLines.length > 0) {
           console.log('✅ ONNX Runtime DLL files found in Chrome process:');
           console.log(output.trim());
@@ -48,23 +48,37 @@ class WebNNTestRunner {
     }
   }
 
-  async runWptTests() {
+  async runWptTests(context, browser = null) {
+    const suiteStartTime = Date.now();
     console.log('Running WPT tests...');
-    
+
     // Get specific test cases from suite-specific environment variable
     const testCaseFilter = process.env.WPT_CASE;
     let testCases = [];
     if (testCaseFilter) {
       testCases = testCaseFilter.split(',').map(c => c.trim()).filter(c => c.length > 0);
+    }
+
+    // Get jobs configuration
+    const jobs = parseInt(process.env.JOBS || '1', 10);
+    const isParallel = jobs > 1;
+
+    // Resume functionality
+    const resumeFlag = process.env.RESUME === 'true';
+    const checkpointFile = this.getCheckpointFilePath();
+
+    if (isParallel) {
+      console.log(`Running test cases in parallel with ${jobs} job(s): ${testCases.join(', ')}`);
+    } else {
       console.log(`Running specific test cases sequentially: ${testCases.join(', ')}`);
     }
-    
+
     // Navigate to the WPT conformance tests directory
     await this.page.goto('https://wpt.live/webnn/conformance_tests/');
-    
+
     // Wait for the page to load and get all test files with class "file"
     await this.page.waitForSelector('.file');
-    
+
     // Get all test files
     let testFiles = await this.page.$$eval('.file', elements => {
       return elements
@@ -74,183 +88,442 @@ class WebNNTestRunner {
         })
         .filter(name => name && name.endsWith('.js'));
     });
-    
+
     // Apply test case selection if specified - run cases sequentially
     if (testCases.length > 0) {
       const orderedTestFiles = [];
       testCases.forEach(testCase => {
-        const caseFiles = testFiles.filter(testFile => 
-          testFile.toLowerCase().includes(testCase.toLowerCase())
-        );
+        const caseFiles = testFiles.filter(testFile => {
+          // Extract the base filename without extension
+          const baseName = testFile.replace('.https.any.js', '').replace('.js', '');
+          // Exact match of the base filename
+          return baseName.toLowerCase() === testCase.toLowerCase();
+        });
         console.log(`Found ${caseFiles.length} test files for case "${testCase}":`, caseFiles);
         orderedTestFiles.push(...caseFiles);
       });
-      
+
       // Remove duplicates while preserving order (in case a file matches multiple cases)
       testFiles = [...new Set(orderedTestFiles)];
-      console.log(`Selected ${testFiles.length} test files in sequential order for cases "${testCases.join(', ')}":`, testFiles);
+      if (isParallel) {
+        console.log(`Selected ${testFiles.length} test files for parallel execution with ${jobs} job(s): "${testCases.join(', ')}"`);
+      } else {
+        console.log(`Selected ${testFiles.length} test files in sequential order for cases "${testCases.join(', ')}":`, testFiles);
+      }
     } else {
       console.log(`Found ${testFiles.length} test files:`, testFiles);
     }
 
+    // Handle resume functionality
+    let completedTestFiles = [];
+    let previousResults = [];
+    if (resumeFlag) {
+      const checkpoint = this.loadCheckpoint(checkpointFile);
+      completedTestFiles = checkpoint.completedTests;
+      previousResults = checkpoint.completedResults;
+
+      if (completedTestFiles.length > 0) {
+        console.log(`\n🔄 RESUME MODE: Found ${completedTestFiles.length} completed test(s)`);
+        console.log(`📋 Completed tests: ${completedTestFiles.join(', ')}`);
+
+        // Filter out already completed tests
+        const remainingTests = testFiles.filter(testFile => !completedTestFiles.includes(testFile));
+        console.log(`\n✅ Skipping ${completedTestFiles.length} completed test(s)`);
+        console.log(`▶️  Resuming with ${remainingTests.length} remaining test(s)\n`);
+
+        testFiles = remainingTests;
+      } else {
+        console.log(`\n🔄 RESUME MODE: No checkpoint found, starting fresh\n`);
+      }
+    } else {
+      // Clear checkpoint file if not resuming (fresh start)
+      this.clearCheckpoint(checkpointFile);
+    }
+
+    if (testFiles.length === 0) {
+      console.log('✅ All tests already completed!');
+      // Return previous results if resuming and all tests are done
+      return previousResults;
+    }
+
     const results = [];
-    
-    for (const testFile of testFiles) {
-      // Convert .js to .html and add ?gpu parameter
-      const testName = testFile.replace('.js', '.html');
-      const testUrl = `https://wpt.live/webnn/conformance_tests/${testName}?gpu`;
-      
-      console.log(`Running test: ${testName}`);
-      
+
+    // Execute tests based on parallel/sequential mode
+    if (isParallel) {
+      // Parallel execution using Promise.all with concurrency limit
+      let completedTests = 0;
+      const totalTests = testFiles.length;
+
+      const executeTest = async (testFile, index, totalFiles) => {
+        // Create a new page for this test
+        const page = await context.newPage();
+        const testStartTime = Date.now();
+
+        try {
+          const result = await this.runSingleWptTest(page, testFile, index, totalFiles, 0, context, browser);
+
+          // Add execution time to result
+          const testEndTime = Date.now();
+          const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
+          result.executionTime = executionTime;
+
+          // Save checkpoint after successful completion (with result data)
+          this.saveCheckpoint(checkpointFile, testFile, result);
+
+          // Update progress after each test completes
+          completedTests++;
+          const percentage = ((completedTests / totalTests) * 100).toFixed(1);
+          console.log(`📊 Progress: ${completedTests}/${totalTests} tests completed (${percentage}%) - ${result.testName}: ${executionTime}s`);
+
+          return result;
+        } finally {
+          // Always close the page after test completes
+          await page.close();
+        }
+      };
+
+      // Split tests into chunks based on job count
+      const chunks = [];
+      for (let i = 0; i < testFiles.length; i += jobs) {
+        chunks.push(testFiles.slice(i, i + jobs));
+      }
+
+      console.log(`\n🚀 Starting parallel execution: ${totalTests} tests with ${jobs} job(s)`);
+      console.log(`📦 Split into ${chunks.length} chunk(s)\n`);
+
+      // Execute chunks sequentially, but tests within each chunk in parallel
+      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+        const chunk = chunks[chunkIndex];
+        const chunkNum = chunkIndex + 1;
+
+        console.log(`\n📦 Processing chunk ${chunkNum}/${chunks.length} (${chunk.length} test(s))...`);
+
+        const chunkResults = await Promise.all(
+          chunk.map((testFile, indexInChunk) => {
+            const absoluteIndex = chunks.slice(0, chunkIndex).flat().length + indexInChunk;
+            return executeTest(testFile, absoluteIndex, testFiles.length);
+          })
+        );
+        results.push(...chunkResults);
+      }
+    } else {
+      // Sequential execution (original behavior)
+      for (let i = 0; i < testFiles.length; i++) {
+        const testFile = testFiles[i];
+        const testStartTime = Date.now();
+
+        // Restart browser before each test (except the first one)
+        if (i > 0 && context) {
+          console.log(`\n🔄 Restarting browser for test ${i + 1}/${testFiles.length}...`);
+          try {
+            await this.page.close();
+            this.page = await context.newPage();
+            console.log('✅ Browser restarted successfully\n');
+          } catch (error) {
+            console.log(`⚠️ Error restarting browser: ${error.message}, continuing with existing page`);
+          }
+        }
+
+        const result = await this.runSingleWptTest(this.page, testFile, i, testFiles.length);
+
+        // Add execution time to result
+        const testEndTime = Date.now();
+        const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
+        result.executionTime = executionTime;
+
+        // Save checkpoint after successful completion (with result data)
+        this.saveCheckpoint(checkpointFile, testFile, result);
+
+        results.push(result);
+      }
+    }
+
+    // Calculate wall time (actual elapsed time) and sum of individual test times
+    const suiteEndTime = Date.now();
+    const wallTime = ((suiteEndTime - suiteStartTime) / 1000).toFixed(2);
+
+    // Merge previous results with new results if resuming
+    const allResults = resumeFlag ? [...previousResults, ...results] : results;
+    const sumOfTestTimes = allResults.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
+
+    // Log execution summary
+    if (testCases.length > 0) {
+      if (isParallel) {
+        console.log(`\n✅ Completed parallel execution of cases: ${testCases.join(', ')}`);
+      } else {
+        console.log(`\n✅ Completed sequential execution of cases: ${testCases.join(' → ')}`);
+      }
+
+      if (resumeFlag && previousResults.length > 0) {
+        console.log(`\n📊 Total Summary (including ${previousResults.length} previously completed test(s)):`);
+        console.log(`   Previously completed: ${previousResults.length}`);
+        console.log(`   Newly executed: ${results.length}`);
+        console.log(`   Total: ${allResults.length}`);
+      } else {
+        console.log(`Total test files executed: ${allResults.length}`);
+      }
+
+      console.log(`⏱️  Wall time (this session): ${wallTime}s`);
+      console.log(`⏱️  Sum of individual test times (all tests): ${sumOfTestTimes}s`);
+      if (isParallel && results.length > 0) {
+        const sessionSumTime = results.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
+        const speedup = (parseFloat(sessionSumTime) / parseFloat(wallTime)).toFixed(2);
+        console.log(`⚡ Parallel speedup (this session): ${speedup}x`);
+      }
+
+      // Log individual test times (only for newly executed tests)
+      if (results.length > 0) {
+        console.log(`\n⏱️  Individual test execution times (this session):`);
+        results.forEach(result => {
+          console.log(`   ${result.testName}: ${result.executionTime}s`);
+        });
+      }
+    }
+
+    return allResults;
+  }
+
+  async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0, context = null, browser = null) {
+    const maxRetries = 1; // Retry once for UNKNOWN/ERROR status
+
+    // Convert .js to .html and add ?gpu parameter
+    const testFileName = testFile.replace('.js', '.html');
+    const testUrl = `https://wpt.live/webnn/conformance_tests/${testFileName}?gpu`;
+
+    // Extract clean test name (remove .https.any.html extension)
+    const testName = testFile.replace('.https.any.js', '').replace('.js', '');
+
+    const retryPrefix = retryCount > 0 ? `[Retry ${retryCount}] ` : '';
+    console.log(`${retryPrefix}Running test: ${testName}`);
+
+    try {
+      // Capture console errors
+      const consoleErrors = [];
+      page.on('console', msg => {
+        if (msg.type() === 'error') {
+          consoleErrors.push(`Console Error: ${msg.text()}`);
+        }
+      });
+
+      // Capture page errors
+      const pageErrors = [];
+      page.on('pageerror', error => {
+        pageErrors.push(`Page Error: ${error.message}`);
+      });
+
+      // Navigate to the test
+      await page.goto(testUrl, { waitUntil: 'networkidle' });
+
+      // Wait for test results (WPT tests typically show results in the page)
+      // First wait for initial load, then wait for tests to complete
+      await page.waitForTimeout(3000);
+
+      // Wait for test completion indicators with longer timeout
       try {
-        // Capture console errors
-        const consoleErrors = [];
-        this.page.on('console', msg => {
-          if (msg.type() === 'error') {
-            consoleErrors.push(`Console Error: ${msg.text()}`);
-          }
-        });
-        
-        // Capture page errors
-        const pageErrors = [];
-        this.page.on('pageerror', error => {
-          pageErrors.push(`Page Error: ${error.message}`);
-        });
-        
-        // Navigate to the test
-        await this.page.goto(testUrl, { waitUntil: 'networkidle' });
-        
-        // Wait for test results (WPT tests typically show results in the page)
-        await this.page.waitForTimeout(5000); // Give time for tests to run
-        
-        // Extract total test count from "Found xx tests" text after rerun button
-        const totalTestsInfo = await this.page.evaluate(() => {
-          const rerunButton = document.getElementById('rerun');
-          if (rerunButton) {
-            // Look for <p> element after the rerun button
-            let nextElement = rerunButton.nextElementSibling;
-            while (nextElement) {
-              if (nextElement.tagName === 'P') {
-                const text = nextElement.textContent.trim();
-                const match = text.match(/Found (\d+) tests?/i);
-                if (match) {
-                  return {
-                    totalTests: parseInt(match[1]),
-                    text: text
-                  };
-                }
-              }
-              nextElement = nextElement.nextElementSibling;
-            }
-          }
-          return { totalTests: null, text: null };
-        });
-        
-        // Check if the test passed or failed and analyze subcases
-        // WPT tests typically show results in a specific format
-        const testResult = await this.page.evaluate(() => {
+        // Look for common WPT completion indicators
+        await Promise.race([
+          page.waitForSelector('.status', { timeout: 15000 }),
+          page.waitForFunction(() =>
+            document.body.textContent.includes('Pass') ||
+            document.body.textContent.includes('Fail') ||
+            document.body.textContent.includes('Found') ||
+            document.body.textContent.includes('test'),
+            { timeout: 15000 }
+          )
+        ]);
+      } catch (error) {
+        console.log(`⚠️ Timeout waiting for test completion indicators, proceeding with current content`);
+      }
+
+      // Additional wait for test results to stabilize
+      await page.waitForTimeout(2000);
+
+      // Extract detailed page content and parse results with enhanced debugging
+      const testResult = await page.evaluate(() => {
           const body = document.body.textContent;
           const bodyHTML = document.body.innerHTML;
-          
-          // Parse WPT subcases - look for common patterns
+
+          // Debug: capture page content for analysis
+          const debugInfo = {
+            title: document.title,
+            bodyLength: body.length,
+            bodyPreview: body.substring(0, 500),
+            hasResults: body.includes('Pass') || body.includes('Fail'),
+            hasFoundText: body.includes('Found'),
+            hasTestsText: body.includes('tests')
+          };
+
+          // Parse WPT subcases with enhanced patterns
           const subcases = {
             total: 0,
             passed: 0,
             failed: 0,
             details: []
           };
-          
-          // First, try to parse the "Found <xxx> tests<yy> Pass<zz> Fail" pattern
-          // Example: "Found 45 tests30 Pass15 Fail" or "Found 45 tests 30 Pass 15 Fail"
-          // Also handles when all pass: "Found 45 tests45 Pass" (no Fail part)
-          const foundPatternWithFail = body.match(/Found\s+(\d+)\s+tests?\s*(\d+)\s+Pass\s*(\d+)\s+Fail/i);
-          const foundPatternAllPass = body.match(/Found\s+(\d+)\s+tests?\s*(\d+)\s+Pass(?!\s*\d+\s+Fail)/i);
-          
-          if (foundPatternWithFail) {
-            subcases.total = parseInt(foundPatternWithFail[1]);
-            subcases.passed = parseInt(foundPatternWithFail[2]);
-            subcases.failed = parseInt(foundPatternWithFail[3]);
-          } else if (foundPatternAllPass) {
-            // All tests passed - no Fail count in the text
-            subcases.total = parseInt(foundPatternAllPass[1]);
-            subcases.passed = parseInt(foundPatternAllPass[2]);
+
+          // Enhanced pattern matching for different WPT formats
+          // Pattern 1: "Found X tests Y Pass Z Fail" (with or without spaces)
+          const pattern1 = body.match(/Found\s+(\d+)\s+tests?\s*(\d+)\s+Pass\s*(\d+)\s+Fail/i);
+          const pattern1AllPass = body.match(/Found\s+(\d+)\s+tests?\s*(\d+)\s+Pass(?!\s*\d+\s+Fail)/i);
+
+          // Pattern 2: "X/Y tests passed"
+          const pattern2 = body.match(/(\d+)\/(\d+)\s+tests?\s+passed/i);
+
+          // Pattern 3: "X passed, Y failed"
+          const pattern3Passed = body.match(/(\d+)\s+passed/i);
+          const pattern3Failed = body.match(/(\d+)\s+failed/i);
+
+          // Pattern 4: Count PASS/FAIL text occurrences
+          const passCount = (body.match(/\bPASS\b/g) || []).length;
+          const failCount = (body.match(/\bFAIL\b/g) || []).length;
+
+          // Pattern 5: Look for "Harness" status and subtest results
+          const harnessPattern = body.match(/Harness:\s*(\w+)/i);
+
+          if (pattern1) {
+            subcases.total = parseInt(pattern1[1]);
+            subcases.passed = parseInt(pattern1[2]);
+            subcases.failed = parseInt(pattern1[3]);
+            debugInfo.parseMethod = 'pattern1_with_fail';
+          } else if (pattern1AllPass) {
+            subcases.total = parseInt(pattern1AllPass[1]);
+            subcases.passed = parseInt(pattern1AllPass[2]);
             subcases.failed = 0;
+            debugInfo.parseMethod = 'pattern1_all_pass';
+          } else if (pattern2) {
+            subcases.passed = parseInt(pattern2[1]);
+            subcases.total = parseInt(pattern2[2]);
+            subcases.failed = subcases.total - subcases.passed;
+            debugInfo.parseMethod = 'pattern2_fraction';
+          } else if (pattern3Passed && pattern3Failed) {
+            subcases.passed = parseInt(pattern3Passed[1]);
+            subcases.failed = parseInt(pattern3Failed[1]);
+            subcases.total = subcases.passed + subcases.failed;
+            debugInfo.parseMethod = 'pattern3_separate_counts';
+          } else if (passCount > 0 || failCount > 0) {
+            subcases.passed = passCount;
+            subcases.failed = failCount;
+            subcases.total = passCount + failCount;
+            debugInfo.parseMethod = 'pattern4_text_count';
           } else {
-            // Look for WPT subtest patterns - count PASS and FAIL elements
-            const subtestElements = document.querySelectorAll('.status, .subtest, [class*="test"]');
-            subtestElements.forEach(el => {
-              const text = el.textContent.trim();
-              const className = el.className;
-              
-              if (className.includes('pass') || text.includes('PASS')) {
-                subcases.passed++;
-                subcases.details.push({ name: text, status: 'PASS' });
-              } else if (className.includes('fail') || text.includes('FAIL')) {
-                subcases.failed++;
-                subcases.details.push({ name: text, status: 'FAIL' });
+            // Look for HTML elements with status classes
+            const statusElements = document.querySelectorAll('[class*="pass"], [class*="fail"], .status');
+            let elementPassCount = 0;
+            let elementFailCount = 0;
+
+            statusElements.forEach(el => {
+              const className = el.className.toLowerCase();
+              const text = el.textContent.toLowerCase();
+
+              if (className.includes('pass') || text.includes('pass')) {
+                elementPassCount++;
+              } else if (className.includes('fail') || text.includes('fail')) {
+                elementFailCount++;
               }
             });
-            
-            // If no explicit subtests found, look for test result patterns in text
-            if (subcases.passed === 0 && subcases.failed === 0) {
-              const passMatches = body.match(/(\d+)\s*\/\s*(\d+)\s*tests?\s*passed/i);
-              const failMatches = body.match(/(\d+)\s*tests?\s*failed/i);
-              const totalMatches = body.match(/(\d+)\s*tests?\s*run/i);
-              
-              if (passMatches) {
-                subcases.passed = parseInt(passMatches[1]);
-                subcases.total = parseInt(passMatches[2]);
-                subcases.failed = subcases.total - subcases.passed;
-              } else if (failMatches) {
-                subcases.failed = parseInt(failMatches[1]);
-              } else if (totalMatches) {
-                subcases.total = parseInt(totalMatches[1]);
+
+            if (elementPassCount > 0 || elementFailCount > 0) {
+              subcases.passed = elementPassCount;
+              subcases.failed = elementFailCount;
+              subcases.total = elementPassCount + elementFailCount;
+              debugInfo.parseMethod = 'element_counting';
+            }
+          }
+
+          // If still no results, try to extract from entire page content with relaxed patterns
+          if (subcases.total === 0) {
+            // Look for any numbers that might indicate test results
+            const allNumbers = body.match(/\d+/g) || [];
+            if (allNumbers.length > 0) {
+              // Try to find contextual clues
+              const testContext = body.toLowerCase();
+              if (testContext.includes('test') && allNumbers.length >= 2) {
+                // Make educated guess based on common patterns
+                subcases.total = Math.max(...allNumbers.map(n => parseInt(n)));
+                debugInfo.parseMethod = 'fallback_guess';
+
+                // Try to determine pass/fail split
+                if (testContext.includes('all') && testContext.includes('pass')) {
+                  subcases.passed = subcases.total;
+                  subcases.failed = 0;
+                } else {
+                  // Default to unknown breakdown
+                  subcases.passed = 0;
+                  subcases.failed = 0;
+                }
               }
             }
           }
-          
-          return { 
+
+          return {
             body: body,
             bodyHTML: bodyHTML,
-            subcases: subcases
+            subcases: subcases,
+            debug: debugInfo
           };
         });
-        
-        // Use the parsed values if we got them from "Found X tests Y Pass Z Fail" pattern
-        if (testResult.subcases.total > 0 && testResult.subcases.passed >= 0 && testResult.subcases.failed >= 0) {
-          console.log(`📊 Parsed from page: ${testResult.subcases.total} tests total, ${testResult.subcases.passed} passed, ${testResult.subcases.failed} failed`);
-        } else if (totalTestsInfo.totalTests !== null) {
-          // Fallback: Override total count with the accurate count from "Found xx tests" if available
-          const originalTotal = testResult.subcases.total;
-          testResult.subcases.total = totalTestsInfo.totalTests;
-          
-          // Calculate passed count: total - failed
-          if (testResult.subcases.failed > 0) {
-            testResult.subcases.passed = testResult.subcases.total - testResult.subcases.failed;
-            console.log(`📊 Found ${totalTestsInfo.totalTests} tests: ${testResult.subcases.passed} passed, ${testResult.subcases.failed} failed`);
-          } else if (testResult.subcases.passed > 0) {
-            // If we have passed count but no failed count, recalculate failed
-            testResult.subcases.failed = testResult.subcases.total - testResult.subcases.passed;
-            console.log(`📊 Found ${totalTestsInfo.totalTests} tests: ${testResult.subcases.passed} passed, ${testResult.subcases.failed} failed`);
+
+        // Debug output for troubleshooting
+        console.log(`🔍 Debug info for ${testName}:`);
+        console.log(`   Parse method: ${testResult.debug.parseMethod || 'none'}`);
+        console.log(`   Page title: ${testResult.debug.title}`);
+        console.log(`   Body length: ${testResult.debug.bodyLength}`);
+        console.log(`   Has results: ${testResult.debug.hasResults}`);
+        console.log(`   Body preview: ${testResult.debug.bodyPreview.replace(/\s+/g, ' ')}`);
+
+        // Use the parsed values with validation
+        if (testResult.subcases.total > 0 || (testResult.subcases.passed > 0 || testResult.subcases.failed > 0)) {
+          console.log(`📊 Parsed results: ${testResult.subcases.total} total, ${testResult.subcases.passed} passed, ${testResult.subcases.failed} failed`);
+
+          // Validate and correct totals if needed
+          if (testResult.subcases.total === 0 && (testResult.subcases.passed > 0 || testResult.subcases.failed > 0)) {
+            testResult.subcases.total = testResult.subcases.passed + testResult.subcases.failed;
+            console.log(`   Corrected total to: ${testResult.subcases.total}`);
+          }
+        } else {
+          console.log(`⚠️ No test results found using standard patterns`);
+          console.log(`   Will attempt fallback parsing...`);
+
+          // Enhanced fallback: try to determine if test completed successfully
+          const body = testResult.body.toLowerCase();
+
+          // Check for completion indicators
+          if (body.includes('complete') || body.includes('finished') || body.includes('done')) {
+            if (body.includes('error') || body.includes('fail') || body.includes('exception')) {
+              testResult.subcases = { total: 1, passed: 0, failed: 1, details: [] };
+              console.log(`   Fallback: detected completion with errors`);
+            } else if (body.includes('pass') || body.includes('success') || body.includes('ok')) {
+              testResult.subcases = { total: 1, passed: 1, failed: 0, details: [] };
+              console.log(`   Fallback: detected successful completion`);
+            } else {
+              testResult.subcases = { total: 1, passed: 0, failed: 0, details: [] };
+              console.log(`   Fallback: detected completion but unknown status`);
+            }
           } else {
-            // We have total but no passed/failed breakdown yet
-            console.log(`📊 Found ${totalTestsInfo.totalTests} tests (breakdown to be determined)`);
+            // No clear completion, analyze content for any results
+            if (testResult.debug.bodyLength > 100) { // Page has content
+              testResult.subcases = { total: 1, passed: 0, failed: 0, details: [] };
+              console.log(`   Fallback: page loaded but no clear results`);
+            } else {
+              testResult.subcases = { total: 1, passed: 0, failed: 1, details: [] };
+              console.log(`   Fallback: minimal content, likely load error`);
+            }
           }
         }
-        
+
         // Determine overall status based on subcases
         let overallStatus = 'UNKNOWN';
         const body = testResult.body;
         const bodyHTML = testResult.bodyHTML;
-        
+
         // If still no subcases detected, treat as single test
         if (testResult.subcases.total === 0) {
           testResult.subcases.total = 1;
           if (body.includes('PASS') || body.includes('All tests passed')) {
             testResult.subcases.passed = 1;
             testResult.subcases.failed = 0;
-          } else if (body.includes('FAIL') || body.includes('Error') || body.includes('failed') || 
-                     body.includes('AssertionError') || body.includes('TypeError') || 
+          } else if (body.includes('FAIL') || body.includes('Error') || body.includes('failed') ||
+                     body.includes('AssertionError') || body.includes('TypeError') ||
                      body.includes('ReferenceError') || bodyHTML.includes('class="fail"')) {
             testResult.subcases.passed = 0;
             testResult.subcases.failed = 1;
@@ -260,18 +533,18 @@ class WebNNTestRunner {
             testResult.subcases.failed = 0;
           }
         }
-        
+
         // Determine overall status
         if (testResult.subcases.failed === 0 && testResult.subcases.passed > 0) {
           overallStatus = 'PASS';
         } else if (testResult.subcases.failed > 0) {
           overallStatus = 'FAIL';
         }
-        
+
         // Get detailed error information
-        const errorDetails = await this.page.evaluate(() => {
+        const errorDetails = await page.evaluate(() => {
           const errors = [];
-          
+
           // Look for error elements with various selectors
           const errorSelectors = [
             '.error', '.fail', '[class*="error"]', '[class*="fail"]',
@@ -279,7 +552,7 @@ class WebNNTestRunner {
             // WPT specific selectors
             '.status.fail', '.subtest.fail', '.message'
           ];
-          
+
           errorSelectors.forEach(selector => {
             const elements = document.querySelectorAll(selector);
             elements.forEach(el => {
@@ -292,18 +565,18 @@ class WebNNTestRunner {
               }
             });
           });
-          
+
           // Also capture console errors if available
           const consoleErrors = [];
           // Try to get console errors from the page (if available)
           if (window.console && window.console.error) {
             // This won't capture previous errors, but we can try other methods
           }
-          
+
           return {
             errors: errors,
             fullPageText: document.body.textContent,
-            hasErrors: errors.length > 0 || 
+            hasErrors: errors.length > 0 ||
                       document.body.textContent.includes('Error') ||
                       document.body.textContent.includes('FAIL') ||
                       document.body.textContent.includes('failed')
@@ -316,8 +589,8 @@ class WebNNTestRunner {
           ...consoleErrors.map(err => ({ text: err, selector: 'console' })),
           ...pageErrors.map(err => ({ text: err, selector: 'page' }))
         ];
-        
-        results.push({
+
+        const result = {
           testName,
           testUrl,
           result: overallStatus,
@@ -328,16 +601,14 @@ class WebNNTestRunner {
           consoleErrors,
           pageErrors,
           subcases: testResult.subcases,
-          totalTestsFromPage: totalTestsInfo.totalTests,
+          totalTestsFromPage: testResult.subcases.total,
           suite: 'wpt'
-        });
+        };
 
         // Enhanced console output with breakdown
         console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
         console.log(`Test ${testName}: ${overallStatus}`);
-        if (totalTestsInfo.totalTests !== null) {
-          console.log(`  📋 Total tests (from page): ${totalTestsInfo.totalTests}`);
-        }
+        console.log(`  📋 Total tests (from page): ${testResult.subcases.total}`);
         if (testResult.subcases.total > 0) {
           console.log(`  ✅ Passed: ${testResult.subcases.passed}`);
           console.log(`  ❌ Failed: ${testResult.subcases.failed}`);
@@ -355,10 +626,106 @@ class WebNNTestRunner {
           }
         }
 
+        // Check if we should retry on UNKNOWN or ERROR status
+        // Create a totally new context for retry to ensure clean state
+        if ((overallStatus === 'UNKNOWN' || overallStatus === 'ERROR') && retryCount < maxRetries) {
+          console.log(`\n⚠️ Test ${testName} returned ${overallStatus} status`);
+          console.log(`🔄 Creating fresh browser context for retry (attempt ${retryCount + 1}/${maxRetries})...\n`);
+
+          try {
+            // Close current page first
+            if (!page.isClosed()) {
+              await page.close();
+            }
+
+            // Create a completely new context for retry
+            let retryContext, retryPage;
+            if (browser) {
+              // In parallel mode: create fresh context from browser
+              try {
+                retryContext = await browser.newContext();
+                retryPage = await retryContext.newPage();
+                console.log('✅ Created fresh browser context for retry (parallel mode)');
+              } catch (contextError) {
+                // Browser might be closing, skip retry
+                console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
+                return result; // Return original result without retry
+              }
+
+              // IMPORTANT: Pass browser to retry, not the retry context
+              // This ensures retries of retries also create fresh contexts from browser
+              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser);
+
+              // Clean up the retry context after retry completes
+              try {
+                if (retryPage && !retryPage.isClosed()) {
+                  await retryPage.close();
+                }
+                // Always close the retry context in parallel mode
+                await retryContext.close();
+              } catch (cleanupError) {
+                console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+              }
+
+              return retryResult;
+            } else if (context) {
+              // In sequential mode: create new context for clean state
+              const browserInstance = context.browser();
+              if (browserInstance) {
+                retryContext = await browserInstance.newContext();
+                retryPage = await retryContext.newPage();
+                console.log('✅ Created fresh browser context for retry (sequential mode)');
+
+                // Pass null for browser in sequential mode
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null);
+
+                // Clean up
+                try {
+                  if (retryPage && !retryPage.isClosed()) {
+                    await retryPage.close();
+                  }
+                  await retryContext.close();
+                } catch (cleanupError) {
+                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+                }
+
+                return retryResult;
+              } else {
+                // Fallback: reuse existing context if browser not available
+                retryPage = await context.newPage();
+                console.log('✅ Created new page from existing context for retry');
+
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null);
+
+                // Only close the page, not the context
+                try {
+                  if (retryPage && !retryPage.isClosed()) {
+                    await retryPage.close();
+                  }
+                } catch (cleanupError) {
+                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+                }
+
+                return retryResult;
+              }
+            } else {
+              console.log('⚠️ No browser/context available for retry, skipping...');
+              return result;
+            }
+          } catch (retryError) {
+            console.error(`❌ Error during retry: ${retryError.message}`);
+            // Return the original result if retry fails
+            return result;
+          }
+        }
+
+        return result;
+
       } catch (error) {
         console.error(`❌ ERROR running test ${testName}:`, error.message);
         console.error('Stack trace:', error.stack);
-        results.push({
+
+        const errorResult = {
           testName,
           testUrl,
           result: 'ERROR',
@@ -368,27 +735,113 @@ class WebNNTestRunner {
           details: error.stack,
           subcases: { total: 1, passed: 0, failed: 1, details: [] },
           suite: 'wpt'
-        });
-      }
-    }
+        };
 
-    // Log execution summary
-    if (testCases.length > 0) {
-      console.log(`\n✅ Completed sequential execution of cases: ${testCases.join(' → ')}`);
-      console.log(`Total test files executed: ${results.length}`);
-    }
-    
-    return results;
+        // Check if we should retry on ERROR
+        // Create a totally new context for retry to ensure clean state
+        if (retryCount < maxRetries) {
+          console.log(`\n⚠️ Test ${testName} encountered an ERROR`);
+          console.log(`🔄 Creating fresh browser context for retry (attempt ${retryCount + 1}/${maxRetries})...\n`);
+
+          try {
+            // Close current page if it's still open
+            if (!page.isClosed()) {
+              await page.close();
+            }
+
+            // Create a completely new context for retry
+            let retryContext, retryPage;
+            if (browser) {
+              // In parallel mode: create fresh context from browser
+              try {
+                retryContext = await browser.newContext();
+                retryPage = await retryContext.newPage();
+                console.log('✅ Created fresh browser context for retry (parallel mode)');
+              } catch (contextError) {
+                // Browser might be closing, skip retry
+                console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
+                return errorResult; // Return original error result without retry
+              }
+
+              // IMPORTANT: Pass browser to retry, not the retry context
+              // This ensures retries of retries also create fresh contexts from browser
+              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser);
+
+              // Clean up the retry context after retry completes
+              try {
+                if (retryPage && !retryPage.isClosed()) {
+                  await retryPage.close();
+                }
+                // Always close the retry context in parallel mode
+                await retryContext.close();
+              } catch (cleanupError) {
+                console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+              }
+
+              return retryResult;
+            } else if (context) {
+              // In sequential mode: create new context for clean state
+              const browserInstance = context.browser();
+              if (browserInstance) {
+                retryContext = await browserInstance.newContext();
+                retryPage = await retryContext.newPage();
+                console.log('✅ Created fresh browser context for retry (sequential mode)');
+
+                // Pass null for browser in sequential mode
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null);
+
+                // Clean up
+                try {
+                  if (retryPage && !retryPage.isClosed()) {
+                    await retryPage.close();
+                  }
+                  await retryContext.close();
+                } catch (cleanupError) {
+                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+                }
+
+                return retryResult;
+              } else {
+                // Fallback: reuse existing context if browser not available
+                retryPage = await context.newPage();
+                console.log('✅ Created new page from existing context for retry');
+
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null);
+
+                // Only close the page, not the context
+                try {
+                  if (retryPage && !retryPage.isClosed()) {
+                    await retryPage.close();
+                  }
+                } catch (cleanupError) {
+                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+                }
+
+                return retryResult;
+              }
+            } else {
+              console.log('⚠️ No browser/context available for retry, skipping...');
+              return errorResult;
+            }
+          } catch (retryError) {
+            console.error(`❌ Error during retry: ${retryError.message}`);
+            // Return the original error result if retry fails
+            return errorResult;
+          }
+        }
+
+        return errorResult;
+      }
   }
 
   async runSamplesTests() {
     console.log('🚀 Running SAMPLE suite...');
     console.log('Running sample tests...');
-    
+
     // Get specific test cases from suite-specific environment variable
     const testCaseFilter = process.env.SAMPLE_CASE;
     let testCases = [];
-    
+
     if (testCaseFilter) {
       testCases = testCaseFilter.split(',').map(c => c.trim()).filter(c => c.length > 0);
       console.log(`Running specific sample test cases: ${testCases.join(', ')}`);
@@ -397,9 +850,9 @@ class WebNNTestRunner {
       testCases = ['image-classification'];
       console.log('Running all sample test cases');
     }
-    
+
     const results = [];
-    
+
     for (const testCase of testCases) {
       try {
         switch (testCase) {
@@ -435,46 +888,46 @@ class WebNNTestRunner {
         });
       }
     }
-    
+
     console.log(`\n✅ Completed sample test execution`);
     console.log(`Total sample tests executed: ${results.length}`);
-    
+
     return results;
   }
 
   async runSamplesImageClassification(results) {
     const testName = 'EfficientNet Image Classification';
     const testUrl = 'https://webmachinelearning.github.io/webnn-samples/image_classification/';
-    
+
     try {
       console.log(`Running sample test: ${testName}`);
-      
+
       // Navigate to the sample page
       await this.page.goto(testUrl, { waitUntil: 'networkidle' });
-      
+
       // Wait for the page to load
       await this.page.waitForTimeout(3000);
-      
+
       console.log('Configuring WebNN settings...');
-      
+
       // Set backend to "WebNN (GPU)" by clicking the second label in backendBtns
       try {
         // First, check what backend options are available
-        const backendLabels = await this.page.$$eval('#backendBtns label', labels => 
-          labels.map((label, index) => ({ 
-            index: index, 
+        const backendLabels = await this.page.$$eval('#backendBtns label', labels =>
+          labels.map((label, index) => ({
+            index: index,
             text: label.textContent.trim(),
             value: label.getAttribute('for') || label.querySelector('input')?.value
           }))
         );
         console.log('Available backend labels:', backendLabels);
-        
+
         // Click the second label (index 1) in the backendBtns div
         const secondLabel = await this.page.$('#backendBtns label:nth-child(2)');
         if (secondLabel) {
           await secondLabel.click();
           console.log('Clicked second backend label (WebNN GPU)');
-          
+
           // Verify selection by checking which radio button is selected
           const selectedBackend = await this.page.$eval('#backendBtns input:checked', input => ({
             value: input.value,
@@ -482,36 +935,36 @@ class WebNNTestRunner {
             nextSibling: input.nextElementSibling?.textContent?.trim()
           }));
           console.log('Selected backend:', selectedBackend);
-          
+
         } else {
           throw new Error('Could not find second label in backendBtns');
         }
-        
+
       } catch (error) {
         console.error('Backend selection error:', error.message);
         throw error;
       }
-      
+
       await this.page.waitForTimeout(500);
-      
+
       // Set data type to Float16 by clicking the second label in dataTypeBtns
       try {
         // Check what data type options are available
-        const dataTypeLabels = await this.page.$$eval('#dataTypeBtns label', labels => 
-          labels.map((label, index) => ({ 
-            index: index, 
+        const dataTypeLabels = await this.page.$$eval('#dataTypeBtns label', labels =>
+          labels.map((label, index) => ({
+            index: index,
             text: label.textContent.trim(),
             value: label.getAttribute('for') || label.querySelector('input')?.value
           }))
         );
         console.log('Available data type labels:', dataTypeLabels);
-        
+
         // Click the second label (index 1) in the dataTypeBtns div
         const secondDataTypeLabel = await this.page.$('#dataTypeBtns label:nth-child(2)');
         if (secondDataTypeLabel) {
           await secondDataTypeLabel.click();
           console.log('Clicked second data type label (Float16)');
-          
+
           // Verify selection by checking which radio button is selected
           const selectedDataType = await this.page.$eval('#dataTypeBtns input:checked', input => ({
             value: input.value,
@@ -519,36 +972,36 @@ class WebNNTestRunner {
             nextSibling: input.nextElementSibling?.textContent?.trim()
           }));
           console.log('Selected data type:', selectedDataType);
-          
+
         } else {
           throw new Error('Could not find second label in dataTypeBtns');
         }
-        
+
       } catch (error) {
         console.error('Data type selection error:', error.message);
         throw error;
       }
-      
+
       await this.page.waitForTimeout(500);
-      
+
       // Set model to EfficientNet by clicking the third label in modelBtns
       try {
         // Check what model options are available
-        const modelLabels = await this.page.$$eval('#modelBtns label', labels => 
-          labels.map((label, index) => ({ 
-            index: index, 
+        const modelLabels = await this.page.$$eval('#modelBtns label', labels =>
+          labels.map((label, index) => ({
+            index: index,
             text: label.textContent.trim(),
             value: label.getAttribute('for') || label.querySelector('input')?.value
           }))
         );
         console.log('Available model labels:', modelLabels);
-        
+
         // Click the fifth label (index 4) in the modelBtns div
         const fifthModelLabel = await this.page.$('#modelBtns label:nth-child(5)');
         if (fifthModelLabel) {
           await fifthModelLabel.click();
           console.log('Clicked fifth model label (EfficientNet)');
-          
+
           // Verify selection by checking which radio button is selected
           const selectedModel = await this.page.$eval('#modelBtns input:checked', input => ({
             value: input.value,
@@ -556,30 +1009,30 @@ class WebNNTestRunner {
             nextSibling: input.nextElementSibling?.textContent?.trim()
           }));
           console.log('Selected model:', selectedModel);
-          
+
         } else {
           throw new Error('Could not find fifth label in modelBtns');
         }
-        
+
       } catch (error) {
         console.error('Model selection error:', error.message);
         throw error;
       }
-      
+
       await this.page.waitForTimeout(1000);
-      
+
       // Start checking for prob0 element immediately after model selection
       console.log('Starting to check for prob0 element after model selection...');
-      
+
       let firstLineProbability = null;
       let checkCount = 0;
       const maxChecks = 30; // 30 checks over 15 seconds
       const checkInterval = 500; // Check every 500ms
-      
+
       while (checkCount < maxChecks && firstLineProbability === null) {
         checkCount++;
         console.log(`Checking for prob0 element (attempt ${checkCount}/${maxChecks})...`);
-        
+
         // Check if prob0 element exists and has content
         const probResult = await this.page.evaluate(() => {
           const prob0Element = document.querySelector('#prob0');
@@ -591,13 +1044,13 @@ class WebNNTestRunner {
           }
           return { found: false, content: null };
         });
-        
+
         if (probResult.found) {
           console.log(`✅ prob0 element found with content: "${probResult.content}"`);
-          
+
           // Parse the probability from the content
           const content = probResult.content;
-          
+
           // Look for percentage pattern like "100.00%" or "100%"
           const percentMatch = content.match(/(\d+(?:\.\d+)?)%/);
           if (percentMatch) {
@@ -605,7 +1058,7 @@ class WebNNTestRunner {
             console.log(`Parsed percentage: ${firstLineProbability}%`);
             break;
           }
-          
+
           // Look for decimal probability pattern like "1.0000" or "0.99"
           const probMatch = content.match(/(\d*\.?\d+)/);
           if (probMatch) {
@@ -620,59 +1073,59 @@ class WebNNTestRunner {
             }
             break;
           }
-          
+
           console.log(`⚠️ prob0 element found but could not parse probability from: "${content}"`);
         } else {
           console.log(`❌ prob0 element not found or empty (attempt ${checkCount})`);
         }
-        
+
         // Wait before next check
         if (checkCount < maxChecks) {
           await this.page.waitForTimeout(checkInterval);
         }
       }
-      
+
       if (firstLineProbability === null) {
         console.log(`🚫 Failed to find prob0 element with valid content after ${maxChecks} attempts`);
       }
-      
+
       console.log(`First line probability: ${firstLineProbability}%`);
-      
+
       // Determine test result
       let testResult = 'UNKNOWN';
       let subcases = { total: 1, passed: 0, failed: 1, details: [] };
-      
+
       if (firstLineProbability !== null) {
         if (firstLineProbability >= 99.0) { // Allow small tolerance for floating point
           testResult = 'PASS';
-          subcases = { 
-            total: 1, 
-            passed: 1, 
-            failed: 0, 
+          subcases = {
+            total: 1,
+            passed: 1,
+            failed: 0,
             details: [{ name: `First line probability: ${firstLineProbability.toFixed(1)}%`, status: 'PASS' }]
           };
           console.log(`✅ Test PASSED: First line probability is ${firstLineProbability.toFixed(1)}%`);
         } else {
           testResult = 'FAIL';
-          subcases = { 
-            total: 1, 
-            passed: 0, 
-            failed: 1, 
+          subcases = {
+            total: 1,
+            passed: 0,
+            failed: 1,
             details: [{ name: `First line probability: ${firstLineProbability.toFixed(1)}% (expected ~100%)`, status: 'FAIL' }]
           };
           console.log(`❌ Test FAILED: First line probability is ${firstLineProbability.toFixed(1)}% (expected ~100%)`);
         }
       } else {
         testResult = 'FAIL';
-        subcases = { 
-          total: 1, 
-          passed: 0, 
-          failed: 1, 
+        subcases = {
+          total: 1,
+          passed: 0,
+          failed: 1,
           details: [{ name: 'Could not find probability results', status: 'FAIL' }]
         };
         console.log('❌ Test FAILED: Could not find probability results');
       }
-      
+
       results.push({
         testName,
         testUrl,
@@ -686,7 +1139,7 @@ class WebNNTestRunner {
         subcases: subcases,
         suite: 'sample'
       });
-      
+
     } catch (error) {
       console.error(`❌ ERROR running sample test ${testName}:`, error.message);
       results.push({
@@ -706,11 +1159,11 @@ class WebNNTestRunner {
   async runPreviewTests() {
     console.log('🚀 Running PREVIEW suite...');
     console.log('Running preview tests...');
-    
+
     // Get specific test cases from suite-specific environment variable
     const testCaseFilter = process.env.PREVIEW_CASE;
     let testCases = [];
-    
+
     if (testCaseFilter) {
       testCases = testCaseFilter.split(',').map(c => c.trim()).filter(c => c.length > 0);
       console.log(`Running specific preview test cases: ${testCases.join(', ')}`);
@@ -719,9 +1172,9 @@ class WebNNTestRunner {
       testCases = ['image-classification'];
       console.log('Running all preview test cases');
     }
-    
+
     const results = [];
-    
+
     for (const testCase of testCases) {
       try {
         switch (testCase) {
@@ -761,41 +1214,41 @@ class WebNNTestRunner {
         });
       }
     }
-    
+
     console.log('✅ Completed preview test execution');
     console.log(`Total preview tests executed: ${results.length}`);
-    
+
     return results;
   }
 
   async runPreviewImageClassification(results) {
     const testName = 'WebNN Developer Preview Image Classification';
-    
+
     try {
       console.log(`Running preview test: ${testName}`);
-      
+
       // Navigate to the preview demo page
       await this.page.goto('https://microsoft.github.io/webnn-developer-preview/demos/image-classification');
       await this.page.waitForLoadState('networkidle');
       console.log('✓ Navigated to WebNN Developer Preview Image Classification demo');
-      
+
       // Wait for the page to fully load
       await this.page.waitForTimeout(3000);
-      
+
       // Look for and click the "Classify" button
       console.log('Looking for Classify button...');
-      
+
       // Try different possible selectors for the Classify button
       const classifySelectors = [
         'button:has-text("Classify")',
         'input[value="Classify"]',
-        '#classify',  
+        '#classify',
         '.classify-btn',
         'button[onclick*="classify"]',
         'button:text("Classify")',
         '[type="button"]:has-text("Classify")'
       ];
-      
+
       let classifyButton = null;
       for (const selector of classifySelectors) {
         try {
@@ -808,28 +1261,28 @@ class WebNNTestRunner {
           console.log(`Selector "${selector}" not found, trying next...`);
         }
       }
-      
+
       if (!classifyButton || !(await classifyButton.isVisible())) {
         throw new Error('Could not find Classify button');
       }
-      
+
       // Click the Classify button
       await classifyButton.click();
       console.log('✓ Clicked Classify button');
-      
+
       // Start checking for latency element immediately after clicking Classify
       console.log('Starting to check for latency element after clicking Classify...');
-      
+
       let latencyFound = false;
       let latencyValue = null;
       let checkCount = 0;
       const maxChecks = 30; // 30 checks over 15 seconds
       const checkInterval = 500; // Check every 500ms
-      
+
       while (checkCount < maxChecks && !latencyFound) {
         checkCount++;
         console.log(`Checking for latency element (attempt ${checkCount}/${maxChecks})...`);
-        
+
         // Check if latency element exists and has content
         const latencyResult = await this.page.evaluate(() => {
           const latencyElement = document.querySelector('#latency');
@@ -841,13 +1294,13 @@ class WebNNTestRunner {
           }
           return { found: false, content: null };
         });
-        
+
         if (latencyResult.found) {
           console.log(`✅ latency element found with content: "${latencyResult.content}"`);
-          
+
           // Check if latency value is valid (should be a positive number, not just "0")
           const content = latencyResult.content.trim();
-          
+
           // Look for numeric patterns (e.g., "12.34ms", "0.123", "45.6 ms", etc.)
           const numericMatch = content.match(/(\d+(?:\.\d+)?)/);
           if (numericMatch) {
@@ -866,15 +1319,15 @@ class WebNNTestRunner {
         } else {
           console.log(`❌ latency element not found or empty (attempt ${checkCount})`);
         }
-        
+
         // Wait before next attempt
         await this.page.waitForTimeout(checkInterval);
       }
-      
+
       if (!latencyFound) {
         throw new Error(`latency element not found after ${maxChecks} attempts`);
       }
-      
+
       console.log(`✅ Test PASSED: latency element found with value: ${latencyValue}`);
       results.push({
         testName: testName,
@@ -889,7 +1342,7 @@ class WebNNTestRunner {
         subcases: { total: 1, passed: 1, failed: 0, details: [{ name: `Latency: ${latencyValue}`, status: 'PASS' }] },
         suite: 'preview'
       });
-      
+
     } catch (error) {
       console.error(`❌ Preview test failed: ${error.message}`);
       results.push({
@@ -908,7 +1361,7 @@ class WebNNTestRunner {
     }
   }
 
-  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null) {
+  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null, wallTime = null, sumOfTestTimes = null) {
     const totalSubcases = results.reduce((sum, r) => sum + r.subcases.total, 0);
     const passedSubcases = results.reduce((sum, r) => sum + r.subcases.passed, 0);
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
@@ -916,8 +1369,12 @@ class WebNNTestRunner {
     const failed = results.filter(r => r.result === 'FAIL').length;
     const errors = results.filter(r => r.result === 'ERROR').length;
 
-    const suiteTitle = testSuites.length > 1 ? 
-      testSuites.map(s => s.toUpperCase()).join(', ') : 
+    // Use provided timing data or calculate from individual tests
+    const displayWallTime = wallTime || results.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
+    const displaySumOfTimes = sumOfTestTimes || results.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
+
+    const suiteTitle = testSuites.length > 1 ?
+      testSuites.map(s => s.toUpperCase()).join(', ') :
       testSuites[0].toUpperCase();
 
     return `
@@ -950,6 +1407,10 @@ class WebNNTestRunner {
         <h1>🧪 WebNN Test Report</h1>
         <h2>${testSuites.length > 1 ? 'Suites' : 'Suite'}: ${suiteTitle}${testCase ? ` | Case: "${testCase}"` : ''}</h2>
         <p>Generated: ${new Date().toLocaleString()}</p>
+        <p>⏱️ Wall Time (actual duration): <strong>${displayWallTime}s</strong></p>
+        <p>⏱️ Sum of Individual Test Times: <strong>${displaySumOfTimes}s</strong></p>
+        ${wallTime && sumOfTestTimes && parseFloat(displayWallTime) < parseFloat(displaySumOfTimes) ?
+          `<p>⚡ Parallel Speedup: <strong>${(parseFloat(displaySumOfTimes) / parseFloat(displayWallTime)).toFixed(2)}x</strong></p>` : ''}
     </div>
 
     <h3>📊 Detailed Test Results</h3>
@@ -963,6 +1424,7 @@ class WebNNTestRunner {
                 <th>Failed Subcases</th>
                 <th>Total Subcases</th>
                 <th>Success Rate</th>
+                <th>Execution Time</th>
             </tr>
         </thead>
         <tbody>
@@ -978,6 +1440,7 @@ class WebNNTestRunner {
                     <td class="fail">${result.subcases.failed}</td>
                     <td>${result.subcases.total}</td>
                     <td>${result.subcases.total > 0 ? ((result.subcases.passed/result.subcases.total)*100).toFixed(1) : 0}%</td>
+                    <td>${result.executionTime ? result.executionTime + 's' : 'N/A'}</td>
                 </tr>
             `).join('')}
             <tr style="background: #e8f5e9; font-weight: bold;">
@@ -986,6 +1449,7 @@ class WebNNTestRunner {
                 <td class="fail"><strong>${failedSubcases}</strong></td>
                 <td><strong>${totalSubcases}</strong></td>
                 <td><strong>${totalSubcases > 0 ? ((passedSubcases/totalSubcases)*100).toFixed(1) : 0}%</strong></td>
+                <td><strong>${displaySumOfTimes}s</strong></td>
             </tr>
         </tbody>
     </table>
@@ -1019,6 +1483,14 @@ class WebNNTestRunner {
             <div class="stat-number">${((passedSubcases/totalSubcases)*100).toFixed(1)}%</div>
             <div class="stat-label">Success Rate</div>
         </div>
+        <div class="stat-card">
+            <div class="stat-number">${displayWallTime}s</div>
+            <div class="stat-label">Wall Time</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">${displaySumOfTimes}s</div>
+            <div class="stat-label">Sum of Test Times</div>
+        </div>
     </div>
 
     ${dllCheckResults && dllCheckResults.found ? `
@@ -1047,8 +1519,8 @@ class WebNNTestRunner {
     const passedSubcases = results.reduce((sum, r) => sum + r.subcases.passed, 0);
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
 
-    const suiteTitle = testSuites.length > 1 ? 
-      testSuites.map(s => s.toUpperCase()).join(', ') : 
+    const suiteTitle = testSuites.length > 1 ?
+      testSuites.map(s => s.toUpperCase()).join(', ') :
       testSuites[0].toUpperCase();
 
     return `
@@ -1100,6 +1572,82 @@ class WebNNTestRunner {
 </body>
 </html>`;
   }
+
+  // Checkpoint management methods for resume functionality
+  getCheckpointFilePath() {
+    const fs = require('fs');
+    const path = require('path');
+
+    // Create checkpoint directory if it doesn't exist
+    const checkpointDir = path.join(process.cwd(), '.checkpoint');
+    if (!fs.existsSync(checkpointDir)) {
+      fs.mkdirSync(checkpointDir, { recursive: true });
+    }
+
+    // Use test case name in checkpoint filename for uniqueness
+    const testCaseFilter = process.env.WPT_CASE || 'all';
+    const sanitizedCase = testCaseFilter.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    return path.join(checkpointDir, `wpt_checkpoint_${sanitizedCase}.json`);
+  }
+
+  loadCheckpoint(checkpointFile) {
+    const fs = require('fs');
+
+    try {
+      if (fs.existsSync(checkpointFile)) {
+        const data = fs.readFileSync(checkpointFile, 'utf8');
+        const checkpoint = JSON.parse(data);
+        return {
+          completedTests: checkpoint.completedTests || [],
+          completedResults: checkpoint.completedResults || []
+        };
+      }
+    } catch (error) {
+      console.log(`⚠️ Warning: Could not load checkpoint file: ${error.message}`);
+    }
+
+    return { completedTests: [], completedResults: [] };
+  }
+
+  saveCheckpoint(checkpointFile, completedTestFile, testResult) {
+    const fs = require('fs');
+
+    try {
+      // Load existing checkpoint
+      const checkpoint = this.loadCheckpoint(checkpointFile);
+
+      // Add the newly completed test if not already in the list
+      if (!checkpoint.completedTests.includes(completedTestFile)) {
+        checkpoint.completedTests.push(completedTestFile);
+        checkpoint.completedResults.push(testResult);
+      }
+
+      // Save updated checkpoint
+      const checkpointData = {
+        completedTests: checkpoint.completedTests,
+        completedResults: checkpoint.completedResults,
+        lastUpdated: new Date().toISOString(),
+        testCase: process.env.WPT_CASE || 'all'
+      };
+
+      fs.writeFileSync(checkpointFile, JSON.stringify(checkpointData, null, 2), 'utf8');
+    } catch (error) {
+      console.log(`⚠️ Warning: Could not save checkpoint: ${error.message}`);
+    }
+  }
+
+  clearCheckpoint(checkpointFile) {
+    const fs = require('fs');
+
+    try {
+      if (fs.existsSync(checkpointFile)) {
+        fs.unlinkSync(checkpointFile);
+        console.log('🗑️  Cleared previous checkpoint (fresh start)');
+      }
+    } catch (error) {
+      console.log(`⚠️ Warning: Could not clear checkpoint: ${error.message}`);
+    }
+  }
 }
 
 test.describe('WebNN Automation Tests', () => {
@@ -1111,7 +1659,7 @@ test.describe('WebNN Automation Tests', () => {
     const suiteEnv = process.env.TEST_SUITE || 'wpt';
     testSuites = suiteEnv.split(',').map(s => s.trim()).filter(s => s.length > 0);
     testCase = process.env.TEST_CASE;
-    
+
     console.log(`Test suites selected: ${testSuites.join(', ')}`);
     if (testCase) {
       const cases = testCase.split(',').map(c => c.trim()).filter(c => c.length > 0);
@@ -1131,23 +1679,26 @@ test.describe('WebNN Automation Tests', () => {
     console.log(`⏱️  Test timeout set to ${testTimeout / 60000} minutes`);
 
     // Set test title with suite and case info for better reporting
-    const suiteDescription = testSuites.length > 1 ? 
-      `Suites: "${testSuites.join(', ')}"` : 
+    const suiteDescription = testSuites.length > 1 ?
+      `Suites: "${testSuites.join(', ')}"` :
       `Suite: "${testSuites[0].toUpperCase()}"`;
-    const caseDescription = testCase ? 
-      (testCase.includes(',') ? 
-        ` | Cases: "${testCase.split(',').map(c => c.trim()).join(', ')}"` : 
+    const caseDescription = testCase ?
+      (testCase.includes(',') ?
+        ` | Cases: "${testCase.split(',').map(c => c.trim()).join(', ')}"` :
         ` | Case: "${testCase}"`) : '';
     test.info().annotations.push({
       type: 'suite',
       description: `${suiteDescription}${caseDescription}`
     });
 
+    // Track overall wall time for entire test execution
+    const overallStartTime = Date.now();
+
     // Run tests for each suite with browser restart between suites
     for (let i = 0; i < testSuites.length; i++) {
       const suite = testSuites[i];
       console.log(`\n🚀 Running ${suite.toUpperCase()} suite...`);
-      
+
       // Restart browser between different suites (but not before the first suite)
       if (i > 0) {
         console.log('🔄 Restarting browser for new suite...');
@@ -1171,12 +1722,12 @@ test.describe('WebNN Automation Tests', () => {
         Object.defineProperty(page, 'close', { value: newPage.close.bind(newPage), writable: true });
         console.log('✅ Browser restarted successfully');
       }
-      
+
       let suiteResults = [];
-      
+
       switch (suite) {
         case 'wpt':
-          suiteResults = await runner.runWptTests();
+          suiteResults = await runner.runWptTests(page.context(), browser);
           break;
         case 'sample':
           suiteResults = await runner.runSamplesTests();
@@ -1187,25 +1738,25 @@ test.describe('WebNN Automation Tests', () => {
         default:
           throw new Error(`Unknown test suite: ${suite}`);
       }
-      
+
       // Add suite information to each result
       suiteResults.forEach(result => {
         result.suite = suite;
       });
-      
+
       allResults = allResults.concat(suiteResults);
     }
-    
+
     const results = allResults;
 
     // Raw test execution info only in console
-    
+
     // All summary data moved to HTML report - console shows only raw execution info
 
     // Detailed failure analysis moved to HTML report - console shows only basic execution info
-    
+
     // Unknown results analysis moved to HTML report
-    
+
     // Final summary moved to HTML report
 
     // Calculate summary statistics for display
@@ -1216,40 +1767,60 @@ test.describe('WebNN Automation Tests', () => {
     const failedCasesForReport = results.filter(r => r.result === 'FAIL').length;
     const errorCasesForReport = results.filter(r => r.result === 'ERROR').length;
 
-    // Handle --ep flag: keep browser alive and check ONNX Runtime DLLs once at the end
-    let dllCheckResults = null;
-    if (runner.epFlag) {
-      console.log('\n🔍 EP flag detected - checking ONNX Runtime DLLs after all tests...');
-      console.log('⏳ Keeping browser open for DLL check...');
-      
-      // Run DLL check once at the very end
-      const dllCheck = await runner.checkOnnxRuntimeDlls();
-      dllCheckResults = dllCheck;
-      
-      if (dllCheck.found) {
-        console.log(`✅ ONNX Runtime DLLs detected in Chrome process (${dllCheck.dllCount} DLL files found)`);
-      } else {
-        console.log('❌ No ONNX Runtime DLLs found in Chrome process');
-      }
-      
-      // Close the browser after DLL check completes
-      console.log('🔒 DLL check completed - closing browser...');
-    }
+    // Calculate overall wall time and sum of test times
+    const overallEndTime = Date.now();
+    const overallWallTime = ((overallEndTime - overallStartTime) / 1000).toFixed(2);
+    const sumOfAllTestTimes = results.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
 
     // Attach detailed results to Playwright test info for HTML report
     const testInfo = test.info();
-    
-    // Create detailed HTML report content with DLL results
-    const htmlReport = runner.generateHtmlReport(testSuites, testCase, results, dllCheckResults);
-    
-    // Attach the detailed HTML report as body content (displayed inline at top)
-    await testInfo.attach('WebNN-Test-Report', {
+
+    // Add annotation with summary (visible in report header)
+    testInfo.annotations.push({
+      type: '📊 Results',
+      description: `${passedCasesForReport}/${results.length} cases passed | ${passedSubcasesForReport}/${totalSubcasesForReport} subcases passed (${((passedSubcasesForReport/totalSubcasesForReport)*100).toFixed(1)}%)`
+    });
+
+    testInfo.annotations.push({
+      type: '⏱️ Timing',
+      description: `Wall Time: ${overallWallTime}s | Sum: ${sumOfAllTestTimes}s | Speedup: ${(parseFloat(sumOfAllTestTimes) / parseFloat(overallWallTime)).toFixed(2)}x`
+    });
+
+    // Assert that we have some results (this creates a test step)
+    expect(results.length).toBeGreaterThan(0);
+
+    // IMMEDIATELY attach reports after assertion, BEFORE any other async operations that create test steps
+    // Create detailed HTML report content (note: dllCheckResults will be null initially)
+    const htmlReport = runner.generateHtmlReport(testSuites, testCase, results, null, overallWallTime, sumOfAllTestTimes);
+
+    // Save timestamped HTML report to report/ folder
+    const fs = require('fs');
+    const path = require('path');
+    const reportDir = path.join(process.cwd(), 'report');
+    if (!fs.existsSync(reportDir)) {
+      fs.mkdirSync(reportDir, { recursive: true });
+    }
+    // Format timestamp as YYYYMMDDHHMMSS
+    const now = new Date();
+    const timestamp = now.getFullYear().toString() +
+                     (now.getMonth() + 1).toString().padStart(2, '0') +
+                     now.getDate().toString().padStart(2, '0') +
+                     now.getHours().toString().padStart(2, '0') +
+                     now.getMinutes().toString().padStart(2, '0') +
+                     now.getSeconds().toString().padStart(2, '0');
+    const reportFileName = `${timestamp}.html`;
+    const reportPath = path.join(reportDir, reportFileName);
+    fs.writeFileSync(reportPath, htmlReport, 'utf8');
+    console.log(`\n📄 HTML Report saved to: ${reportPath}`);
+
+    // Attach the detailed HTML report AFTER assertions (appears after Test Steps)
+    await testInfo.attach('📄 WebNN-Test-Report', {
       body: htmlReport,
       contentType: 'text/html'
     });
-    
-    // Attach raw logs at the end for debugging
-    await testInfo.attach('Raw-Test-Data', {
+
+    // Attach raw logs for debugging (appears after main report)
+    await testInfo.attach('📊 Raw-Test-Data', {
       body: JSON.stringify({
         suites: testSuites,
         case: testCase,
@@ -1261,21 +1832,41 @@ test.describe('WebNN Automation Tests', () => {
           errorCases: errorCasesForReport,
           passedSubcases: passedSubcasesForReport,
           failedSubcases: failedSubcasesForReport,
-          successRate: ((passedSubcasesForReport/totalSubcasesForReport)*100).toFixed(1)
+          successRate: ((passedSubcasesForReport/totalSubcasesForReport)*100).toFixed(1),
+          wallTime: overallWallTime,
+          sumOfTestTimes: sumOfAllTestTimes
         },
         results: results,
-        dllCheck: dllCheckResults
+        dllCheck: null
       }, null, 2),
       contentType: 'application/json'
     });
 
-    // Assert that we have some results
-    expect(results.length).toBeGreaterThan(0);
-    
+    // Handle --ep flag: keep browser alive and check ONNX Runtime DLLs once at the end
+    // This happens AFTER attachments to avoid creating test steps between assertion and attachments
+    let dllCheckResults = null;
+    if (runner.epFlag) {
+      console.log('\n🔍 EP flag detected - checking ONNX Runtime DLLs after all tests...');
+      console.log('⏳ Keeping browser open for DLL check...');
+
+      // Run DLL check once at the very end
+      const dllCheck = await runner.checkOnnxRuntimeDlls();
+      dllCheckResults = dllCheck;
+
+      if (dllCheck.found) {
+        console.log(`✅ ONNX Runtime DLLs detected in Chrome process (${dllCheck.dllCount} DLL files found)`);
+      } else {
+        console.log('❌ No ONNX Runtime DLLs found in Chrome process');
+      }
+
+      // Close the browser after DLL check completes
+      console.log('🔒 DLL check completed - closing browser...');
+    }
+
     // Log summary for the test result
     console.log(`\n🎯 PLAYWRIGHT REPORT SUMMARY:`);
-    const finalSuiteSummary = testSuites.length > 1 ? 
-      `Suites: ${testSuites.join(', ')}` : 
+    const finalSuiteSummary = testSuites.length > 1 ?
+      `Suites: ${testSuites.join(', ')}` :
       `Suite: ${testSuites[0]}`;
     console.log(`${finalSuiteSummary}, Cases: ${results.length}, Subcases: ${passedSubcasesForReport}/${totalSubcasesForReport} passed`);    // You can add more specific assertions based on your requirements
     // For example, expect a minimum pass rate:

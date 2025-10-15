@@ -9,6 +9,9 @@ test-results/
 report/
 playwright/.cache/
 
+# Checkpoint files (resume functionality)
+.checkpoint/
+
 # OS generated files
 .DS_Store
 .DS_Store?

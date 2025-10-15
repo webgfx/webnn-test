@@ -18,9 +18,9 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
   reporter: [
-    ['html', { 
+    ['html', {
       open: 'never',
-      outputFolder: 'report'
+      outputFolder: 'report-temp'
     }]
   ],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
@@ -30,7 +30,7 @@ export default defineConfig({
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
-    
+
     /* Make browser visible during test execution */
     headless: false,
   },
@@ -39,7 +39,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium-canary',
-      use: { 
+      use: {
         ...devices['Desktop Chrome'],
         // Use Chrome Canary with WebNN features enabled
         launchOptions: {
