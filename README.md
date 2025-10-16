@@ -60,9 +60,12 @@ node src/test.js --suite wpt,sample --wpt-case abs --ep
 node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
 node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 4
 
-# Resume from where you left off (if tests were interrupted)
-node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --resume
-node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
+# Run tests multiple times (repeat mode)
+node src/test.js --suite wpt --wpt-case "add,sub" --repeat 3
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --repeat 5
+
+# Combine all options
+node src/test.js --suite wpt --wpt-case "add,sub" --jobs 2 --repeat 3 --ep
 ```
 
 ### Method 2: Using npm scripts
@@ -149,42 +152,115 @@ node src/test.js --suite wpt --jobs 8
 - Wall time vs sum of individual test times shows speedup
 - Each test runs in isolated browser context
 
-## Resume Functionality
+## Repeat Mode
 
-If your test run is interrupted or quits in an unfinished state, you can resume from where you left off:
+Run the entire test suite multiple times for stability testing or performance analysis:
 
 ```bash
-# First run (might be interrupted)
-node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+# Run tests 3 times
+node src/test.js --suite wpt --wpt-case "add,sub" --repeat 3
 
-# Resume from the last completed test
-node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
+# Run with parallel execution, repeated 5 times
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --repeat 5
 
-# Works with both sequential and parallel execution
-node src/test.js --suite wpt --wpt-case abs --resume
+# Combine with all options
+node src/test.js --suite wpt --wpt-case "add" --jobs 4 --repeat 10 --ep
 ```
 
 **How it works:**
-- Progress is automatically saved after each test completes
-- Checkpoint files are stored in `.checkpoint/` directory
-- Use `--resume` flag to skip already completed tests
-- Without `--resume`, tests start fresh (checkpoint is cleared)
-- Each test case combination gets its own checkpoint file
+- 🔁 **Independent iterations**: Each iteration is a standalone test run
+- 🧹 **Fresh start**: Checkpoint cleared before each iteration
+- 📊 **Separate reports**: Each iteration gets its own timestamped report with `_iterN` suffix
+- ⏱️ **2-second delay**: Brief pause between iterations for stability
+- 📈 **Summary**: Shows pass/fail status for all iterations at the end
+
+**Example output:**
+```bash
+node src/test.js --suite wpt --wpt-case "add,sub" --repeat 3
+
+# Output:
+================================================================================
+🔁 ITERATION 1/3
+================================================================================
+# ... tests run ...
+✅ [Iteration 1/3] Test iteration completed successfully
+📄 [Iteration 1/3] Timestamped report: report/20251016143025_iter1.html
+
+⏳ Waiting 2 seconds before next iteration...
+
+================================================================================
+🔁 ITERATION 2/3
+================================================================================
+# ... tests run ...
+✅ [Iteration 2/3] Test iteration completed successfully
+📄 [Iteration 2/3] Timestamped report: report/20251016143142_iter2.html
+
+⏳ Waiting 2 seconds before next iteration...
+
+================================================================================
+🔁 ITERATION 3/3
+================================================================================
+# ... tests run ...
+✅ [Iteration 3/3] Test iteration completed successfully
+📄 [Iteration 3/3] Timestamped report: report/20251016143258_iter3.html
+
+================================================================================
+📊 REPEAT SUMMARY - All 3 iteration(s) completed
+================================================================================
+   Iteration 1: ✅ PASS
+   Iteration 2: ✅ PASS
+   Iteration 3: ✅ PASS
+================================================================================
+```
+
+**Use cases:**
+- 🎯 **Stability testing**: Verify tests pass consistently across multiple runs
+- 📊 **Performance analysis**: Compare execution times across iterations
+- 🐛 **Flakiness detection**: Identify intermittent failures
+- 🔬 **Stress testing**: Run tests repeatedly to catch edge cases
+
+## Automatic Checkpoint & Resume
+
+The test runner automatically saves progress and resumes from where it left off if interrupted:
+
+**How it works:**
+- ✅ **Automatic**: No flags needed - resume is always enabled
+- 💾 **Progress saved**: Checkpoint saved after each test completes
+- 🔄 **Auto-resume**: Next run automatically skips completed tests
+- 📁 **Checkpoint files**: Stored in `.checkpoint/` directory (git-ignored)
+- 🎯 **Test-specific**: Each test case combination has its own checkpoint
+- 🧹 **Clean slate**: Delete `.checkpoint/` folder to start completely fresh
 
 **Example:**
 ```bash
 # Start a test run with 10 tests
 node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+# Tests 1-5 complete...
+# Press Ctrl+C to interrupt
 
-# Press Ctrl+C after 5 tests complete
-
-# Resume and continue from test 6
-node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --resume
-# Output: "🔄 RESUME MODE: Found 5 completed test(s)"
+# Run again - automatically resumes
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+# Output: "🔄 AUTO-RESUME: Found 5 completed test(s) from previous run"
 #         "▶️  Resuming with 5 remaining test(s)"
+# Continues from test 6...
 ```
 
-**Note:** Checkpoint files are specific to the test case combination. Changing `--wpt-case` will use a different checkpoint file.
+**Smart retry logic:**
+- ✅ **PASS/FAIL results**: Saved to checkpoint (won't re-run)
+- ⚠️ **ERROR/UNKNOWN results**: NOT saved (will retry on next run)
+- 🔁 **Failed tests**: Retry until 2 consecutive identical failures seen
+- ⏱️ **Wall time**: Accumulated across all sessions
+
+**To start completely fresh:**
+```bash
+# Delete checkpoint folder
+Remove-Item -Recurse -Force .checkpoint
+# or on Linux/Mac:
+rm -rf .checkpoint
+
+# Run tests
+node src/test.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2
+```
 
 ## Configuration
 

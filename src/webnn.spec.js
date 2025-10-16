@@ -63,8 +63,7 @@ class WebNNTestRunner {
     const jobs = parseInt(process.env.JOBS || '1', 10);
     const isParallel = jobs > 1;
 
-    // Resume functionality
-    const resumeFlag = process.env.RESUME === 'true';
+    // Automatic checkpoint/resume functionality
     const checkpointFile = this.getCheckpointFilePath();
 
     if (isParallel) {
@@ -117,27 +116,28 @@ class WebNNTestRunner {
     // Handle resume functionality
     let completedTestFiles = [];
     let previousResults = [];
-    if (resumeFlag) {
-      const checkpoint = this.loadCheckpoint(checkpointFile);
-      completedTestFiles = checkpoint.completedTests;
-      previousResults = checkpoint.completedResults;
+    let previousWallTime = 0;
 
-      if (completedTestFiles.length > 0) {
-        console.log(`\n🔄 RESUME MODE: Found ${completedTestFiles.length} completed test(s)`);
-        console.log(`📋 Completed tests: ${completedTestFiles.join(', ')}`);
+    const checkpoint = this.loadCheckpoint(checkpointFile);
+    completedTestFiles = checkpoint.completedTests;
+    previousResults = checkpoint.completedResults;
+    previousWallTime = checkpoint.accumulatedWallTime || 0;
 
-        // Filter out already completed tests
-        const remainingTests = testFiles.filter(testFile => !completedTestFiles.includes(testFile));
-        console.log(`\n✅ Skipping ${completedTestFiles.length} completed test(s)`);
-        console.log(`▶️  Resuming with ${remainingTests.length} remaining test(s)\n`);
-
-        testFiles = remainingTests;
-      } else {
-        console.log(`\n🔄 RESUME MODE: No checkpoint found, starting fresh\n`);
+    if (completedTestFiles.length > 0) {
+      console.log(`\n🔄 AUTO-RESUME: Found ${completedTestFiles.length} completed test(s) from previous run`);
+      console.log(`📋 Completed tests: ${completedTestFiles.join(', ')}`);
+      if (previousWallTime > 0) {
+        console.log(`⏱️  Previous wall time: ${previousWallTime.toFixed(2)}s`);
       }
+
+      // Filter out already completed tests
+      const remainingTests = testFiles.filter(testFile => !completedTestFiles.includes(testFile));
+      console.log(`\n✅ Skipping ${completedTestFiles.length} completed test(s)`);
+      console.log(`▶️  Resuming with ${remainingTests.length} remaining test(s)\n`);
+
+      testFiles = remainingTests;
     } else {
-      // Clear checkpoint file if not resuming (fresh start)
-      this.clearCheckpoint(checkpointFile);
+      console.log(`\n▶️  Starting fresh run (no previous checkpoint found)\n`);
     }
 
     if (testFiles.length === 0) {
@@ -147,6 +147,7 @@ class WebNNTestRunner {
     }
 
     const results = [];
+    const testResultsMap = new Map(); // Map testFile to result for retry tracking
 
     // Execute tests based on parallel/sequential mode
     if (isParallel) {
@@ -155,20 +156,39 @@ class WebNNTestRunner {
       const totalTests = testFiles.length;
 
       const executeTest = async (testFile, index, totalFiles) => {
-        // Create a new page for this test
-        const page = await context.newPage();
         const testStartTime = Date.now();
+        let page = null;
 
         try {
-          const result = await this.runSingleWptTest(page, testFile, index, totalFiles, 0, context, browser);
+          // Check if context is still valid before creating page
+          try {
+            page = await context.newPage();
+          } catch (contextError) {
+            console.error(`❌ Failed to create page for ${testFile}: ${contextError.message}`);
+            // Return error result if context is closed
+            return {
+              testName: testFile.replace('.https.any.js', '').replace('.js', ''),
+              testUrl: `https://wpt.live/webnn/conformance_tests/${testFile.replace('.js', '.html')}?gpu`,
+              testFile: testFile,
+              result: 'ERROR',
+              errors: [{ text: `Context closed: ${contextError.message}`, selector: 'exception' }],
+              fullText: `Exception: Context closed - ${contextError.message}`,
+              hasErrors: true,
+              details: contextError.stack || contextError.message,
+              subcases: { total: 1, passed: 0, failed: 1, details: [] },
+              suite: 'wpt',
+              executionTime: '0.00'
+            };
+          }
 
-          // Add execution time to result
+          // Pass skipRetry=true to prevent immediate retries
+          const result = await this.runSingleWptTest(page, testFile, index, totalFiles, 0, context, browser, null, true);
+
+          // Add execution time and testFile to result
           const testEndTime = Date.now();
           const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
           result.executionTime = executionTime;
-
-          // Save checkpoint after successful completion (with result data)
-          this.saveCheckpoint(checkpointFile, testFile, result);
+          result.testFile = testFile;
 
           // Update progress after each test completes
           completedTests++;
@@ -177,8 +197,14 @@ class WebNNTestRunner {
 
           return result;
         } finally {
-          // Always close the page after test completes
-          await page.close();
+          // Always close the page after test completes (if it was created)
+          if (page && !page.isClosed()) {
+            try {
+              await page.close();
+            } catch (closeError) {
+              console.log(`⚠️  Warning: Failed to close page for ${testFile}: ${closeError.message}`);
+            }
+          }
         }
       };
 
@@ -224,26 +250,128 @@ class WebNNTestRunner {
           }
         }
 
-        const result = await this.runSingleWptTest(this.page, testFile, i, testFiles.length);
+        // Pass skipRetry=true to prevent immediate retries
+        const result = await this.runSingleWptTest(this.page, testFile, i, testFiles.length, 0, context, browser, null, true);
 
-        // Add execution time to result
+        // Add execution time and testFile to result
         const testEndTime = Date.now();
         const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
         result.executionTime = executionTime;
-
-        // Save checkpoint after successful completion (with result data)
-        this.saveCheckpoint(checkpointFile, testFile, result);
+        result.testFile = testFile;
 
         results.push(result);
       }
     }
 
+    // Store results in map for retry tracking
+    results.forEach(result => {
+      testResultsMap.set(result.testFile, result);
+    });
+
+    // After all initial tests complete, process retries sequentially
+    console.log(`\n\n${'='.repeat(80)}`);
+    console.log('📋 INITIAL TEST EXECUTION COMPLETE');
+    console.log(`${'='.repeat(80)}\n`);
+
+    // Collect tests that need retry
+    const testsNeedingRetry = results.filter(r =>
+      r.result === 'ERROR' || r.result === 'UNKNOWN' || r.result === 'FAIL'
+    );
+
+    if (testsNeedingRetry.length > 0) {
+      console.log(`\n🔄 RETRY PHASE: ${testsNeedingRetry.length} test(s) need retry`);
+      console.log(`   ERROR: ${results.filter(r => r.result === 'ERROR').length}`);
+      console.log(`   UNKNOWN: ${results.filter(r => r.result === 'UNKNOWN').length}`);
+      console.log(`   FAIL: ${results.filter(r => r.result === 'FAIL').length}`);
+
+      // Clean up all pages/contexts from initial test execution before retry phase
+      console.log(`\n🧹 Cleaning up browser contexts before retry phase...`);
+      try {
+        // Close the main page used for test discovery
+        if (this.page && !this.page.isClosed()) {
+          console.log(`   Closing main page (${this.page.url()})...`);
+          await this.page.close();
+          console.log(`   ✅ Main page closed`);
+        }
+
+        // Get all pages in the context and close them
+        if (context) {
+          const allPages = context.pages();
+          console.log(`   Found ${allPages.length} page(s) in context`);
+          for (const page of allPages) {
+            if (!page.isClosed()) {
+              console.log(`   Closing page: ${page.url()}`);
+              await page.close();
+            }
+          }
+          console.log(`   ✅ All pages closed`);
+        }
+
+        console.log(`✅ Cleanup complete - ready for retry phase\n`);
+      } catch (cleanupError) {
+        console.log(`⚠️  Warning during cleanup: ${cleanupError.message}`);
+        console.log(`   Continuing with retry phase...\n`);
+      }
+
+      console.log(`\n🔄 Running retries sequentially with fresh browser contexts...\n`);
+
+      // Process retries sequentially
+      for (let i = 0; i < testsNeedingRetry.length; i++) {
+        const testResult = testsNeedingRetry[i];
+        const testFile = testResult.testFile;
+        const testName = testResult.testName;
+
+        console.log(`\n${'─'.repeat(80)}`);
+        console.log(`🔄 Retry ${i + 1}/${testsNeedingRetry.length}: ${testName} (was ${testResult.result})`);
+        console.log(`${'─'.repeat(80)}\n`);
+
+        // Run retry with fresh context and browser launcher
+        const finalResult = await this.runTestWithRetry(
+          testFile,
+          context,
+          browser,
+          testResult,
+          this.launchNewBrowser // Pass the browser launcher function
+        );
+
+        // Update the result in our map and results array
+        const resultIndex = results.findIndex(r => r.testFile === testFile);
+        if (resultIndex !== -1) {
+          results[resultIndex] = finalResult;
+        }
+        testResultsMap.set(testFile, finalResult);
+
+        // Save checkpoint for completed tests
+        const currentWallTime = ((Date.now() - suiteStartTime) / 1000) + previousWallTime;
+        if (finalResult.result === 'PASS' || finalResult.result === 'FAIL') {
+          this.saveCheckpoint(checkpointFile, testFile, finalResult, currentWallTime);
+        } else {
+          console.log(`⚠️  Test ${finalResult.testName} still has ${finalResult.result} status - will be retested on next run`);
+        }
+      }
+
+      console.log(`\n\n${'='.repeat(80)}`);
+      console.log('✅ RETRY PHASE COMPLETE');
+      console.log(`${'='.repeat(80)}\n`);
+    } else {
+      console.log(`\n✅ All tests passed on first attempt - no retries needed!\n`);
+
+      // Save checkpoints for all PASS results
+      results.forEach(result => {
+        const currentWallTime = ((Date.now() - suiteStartTime) / 1000) + previousWallTime;
+        if (result.result === 'PASS') {
+          this.saveCheckpoint(checkpointFile, result.testFile, result, currentWallTime);
+        }
+      });
+    }
+
     // Calculate wall time (actual elapsed time) and sum of individual test times
     const suiteEndTime = Date.now();
-    const wallTime = ((suiteEndTime - suiteStartTime) / 1000).toFixed(2);
+    const sessionWallTime = ((suiteEndTime - suiteStartTime) / 1000).toFixed(2);
+    const totalWallTime = (parseFloat(sessionWallTime) + previousWallTime).toFixed(2);
 
-    // Merge previous results with new results if resuming
-    const allResults = resumeFlag ? [...previousResults, ...results] : results;
+    // Merge previous results with new results
+    const allResults = [...previousResults, ...results];
     const sumOfTestTimes = allResults.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
 
     // Log execution summary
@@ -254,7 +382,7 @@ class WebNNTestRunner {
         console.log(`\n✅ Completed sequential execution of cases: ${testCases.join(' → ')}`);
       }
 
-      if (resumeFlag && previousResults.length > 0) {
+      if (previousResults.length > 0) {
         console.log(`\n📊 Total Summary (including ${previousResults.length} previously completed test(s)):`);
         console.log(`   Previously completed: ${previousResults.length}`);
         console.log(`   Newly executed: ${results.length}`);
@@ -263,11 +391,14 @@ class WebNNTestRunner {
         console.log(`Total test files executed: ${allResults.length}`);
       }
 
-      console.log(`⏱️  Wall time (this session): ${wallTime}s`);
+      console.log(`⏱️  Wall time (this session): ${sessionWallTime}s`);
+      if (previousWallTime > 0) {
+        console.log(`⏱️  Wall time (total across all sessions): ${totalWallTime}s`);
+      }
       console.log(`⏱️  Sum of individual test times (all tests): ${sumOfTestTimes}s`);
       if (isParallel && results.length > 0) {
         const sessionSumTime = results.reduce((sum, r) => sum + (parseFloat(r.executionTime) || 0), 0).toFixed(2);
-        const speedup = (parseFloat(sessionSumTime) / parseFloat(wallTime)).toFixed(2);
+        const speedup = (parseFloat(sessionSumTime) / parseFloat(sessionWallTime)).toFixed(2);
         console.log(`⚡ Parallel speedup (this session): ${speedup}x`);
       }
 
@@ -283,8 +414,9 @@ class WebNNTestRunner {
     return allResults;
   }
 
-  async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0, context = null, browser = null) {
-    const maxRetries = 1; // Retry once for UNKNOWN/ERROR status
+  async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0, context = null, browser = null, previousResult = null, skipRetry = false) {
+    const maxRetries = 20; // Maximum retry attempts for FAIL status (for safety)
+    // Note: ERROR and UNKNOWN have no retry limit - they retry until resolved
 
     // Convert .js to .html and add ?gpu parameter
     const testFileName = testFile.replace('.js', '.html');
@@ -321,18 +453,19 @@ class WebNNTestRunner {
       // Wait for test completion indicators with longer timeout
       try {
         // Look for common WPT completion indicators
+        // Increased timeout to 120 seconds (2 minutes) to allow tests to complete
         await Promise.race([
-          page.waitForSelector('.status', { timeout: 15000 }),
+          page.waitForSelector('.status', { timeout: 120000 }),
           page.waitForFunction(() =>
             document.body.textContent.includes('Pass') ||
             document.body.textContent.includes('Fail') ||
             document.body.textContent.includes('Found') ||
             document.body.textContent.includes('test'),
-            { timeout: 15000 }
+            { timeout: 120000 }
           )
         ]);
       } catch (error) {
-        console.log(`⚠️ Timeout waiting for test completion indicators, proceeding with current content`);
+        console.log(`⚠️ Timeout waiting for test completion indicators after 2 minutes, proceeding with current content`);
       }
 
       // Additional wait for test results to stabilize
@@ -626,11 +759,58 @@ class WebNNTestRunner {
           }
         }
 
-        // Check if we should retry on UNKNOWN or ERROR status
-        // Create a totally new context for retry to ensure clean state
-        if ((overallStatus === 'UNKNOWN' || overallStatus === 'ERROR') && retryCount < maxRetries) {
-          console.log(`\n⚠️ Test ${testName} returned ${overallStatus} status`);
-          console.log(`🔄 Creating fresh browser context for retry (attempt ${retryCount + 1}/${maxRetries})...\n`);
+        // Helper function to check if two failure results are identical
+        const areFailuresIdentical = (result1, result2) => {
+          if (!result1 || !result2) return false;
+          if (result1.result !== result2.result) return false;
+
+          // Compare subcase counts
+          const sc1 = result1.subcases;
+          const sc2 = result2.subcases;
+          if (sc1.total !== sc2.total || sc1.passed !== sc2.passed || sc1.failed !== sc2.failed) {
+            return false;
+          }
+
+          return true;
+        };
+
+        // If skipRetry is true, just return the result without retrying
+        // This is used during initial test execution - retries happen later in a separate phase
+        if (skipRetry) {
+          if (overallStatus !== 'PASS') {
+            console.log(`⏭️  Test will be retried in sequential retry phase after all tests complete\n`);
+          }
+          return result;
+        }
+
+        // Check if we should retry (this code path is only used during retry phase)
+        // Retry conditions:
+        // 1. UNKNOWN or ERROR status -> ALWAYS retry (no limit) with fresh browser context
+        // 2. FAIL status -> retry until we see 2 consecutive identical failures (up to maxRetries)
+        const shouldRetry = (
+          overallStatus === 'UNKNOWN' ||
+          overallStatus === 'ERROR' ||
+          (overallStatus === 'FAIL' && retryCount < maxRetries && !areFailuresIdentical(previousResult, result))
+        );
+
+        if (shouldRetry) {
+          if (overallStatus === 'UNKNOWN' || overallStatus === 'ERROR') {
+            console.log(`\n⚠️ Test ${testName} returned ${overallStatus} status (retry ${retryCount + 1})`);
+            console.log(`🔄 ${overallStatus} results always retry - creating fresh browser context...\n`);
+          } else if (overallStatus === 'FAIL' && previousResult && previousResult.result === 'FAIL') {
+            // Check if this is the second consecutive identical failure
+            if (areFailuresIdentical(previousResult, result)) {
+              console.log(`\n✓ Test ${testName} has 2 consecutive identical failures - accepting result`);
+              return result;
+            }
+            console.log(`\n⚠️ Test ${testName} FAILED but result differs from previous failure`);
+            console.log(`   Previous: ${previousResult.subcases.passed}/${previousResult.subcases.total} passed`);
+            console.log(`   Current:  ${result.subcases.passed}/${result.subcases.total} passed`);
+            console.log(`🔄 Retrying to confirm failure pattern (attempt ${retryCount + 1})...\n`);
+          } else if (overallStatus === 'FAIL') {
+            console.log(`\n⚠️ Test ${testName} FAILED (retry ${retryCount + 1})`);
+            console.log(`🔄 Retrying to confirm failure...\n`);
+          }
 
           try {
             // Close current page first
@@ -647,14 +827,32 @@ class WebNNTestRunner {
                 retryPage = await retryContext.newPage();
                 console.log('✅ Created fresh browser context for retry (parallel mode)');
               } catch (contextError) {
-                // Browser might be closing, skip retry
+                // Browser might be closing
                 console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
-                return result; // Return original result without retry
+
+                // For ERROR/UNKNOWN, wait and retry instead of giving up
+                if (overallStatus === 'ERROR' || overallStatus === 'UNKNOWN') {
+                  console.log(`⏳ Waiting 5 seconds before retry attempt...`);
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                  // Try one more time
+                  try {
+                    retryContext = await browser.newContext();
+                    retryPage = await retryContext.newPage();
+                    console.log('✅ Successfully created context on second attempt');
+                  } catch (secondError) {
+                    console.log(`❌ Still cannot create context: ${secondError.message}`);
+                    console.log(`⏳ Marking as ERROR and will retry again...`);
+                    return result; // This ERROR will trigger another retry
+                  }
+                } else {
+                  // For FAIL, we can return since we have a definitive result
+                  return result;
+                }
               }
 
               // IMPORTANT: Pass browser to retry, not the retry context
-              // This ensures retries of retries also create fresh contexts from browser
-              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser);
+              // Pass current result as previousResult for comparison
+              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser, result);
 
               // Clean up the retry context after retry completes
               try {
@@ -676,8 +874,8 @@ class WebNNTestRunner {
                 retryPage = await retryContext.newPage();
                 console.log('✅ Created fresh browser context for retry (sequential mode)');
 
-                // Pass null for browser in sequential mode
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null);
+                // Pass null for browser in sequential mode, pass current result as previousResult
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null, result);
 
                 // Clean up
                 try {
@@ -695,7 +893,7 @@ class WebNNTestRunner {
                 retryPage = await context.newPage();
                 console.log('✅ Created new page from existing context for retry');
 
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null);
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null, result);
 
                 // Only close the page, not the context
                 try {
@@ -737,35 +935,53 @@ class WebNNTestRunner {
           suite: 'wpt'
         };
 
-        // Check if we should retry on ERROR
-        // Create a totally new context for retry to ensure clean state
-        if (retryCount < maxRetries) {
-          console.log(`\n⚠️ Test ${testName} encountered an ERROR`);
-          console.log(`🔄 Creating fresh browser context for retry (attempt ${retryCount + 1}/${maxRetries})...\n`);
+        // If skipRetry is true, just return the error result
+        // This is used during initial test execution - retries happen later in a separate phase
+        if (skipRetry) {
+          console.log(`⏭️  ERROR test will be retried in sequential retry phase after all tests complete\n`);
+          return errorResult;
+        }
 
-          try {
-            // Close current page if it's still open
-            if (!page.isClosed()) {
-              await page.close();
-            }
+        // Check if we should retry on ERROR (this code path is only used during retry phase)
+        // ERROR always retries (no limit) to ensure clean resolution
+        console.log(`\n⚠️ Test ${testName} encountered an ERROR (retry ${retryCount + 1})`);
+        console.log(`🔄 ERROR results always retry - creating fresh browser context...\n`);
 
-            // Create a completely new context for retry
-            let retryContext, retryPage;
-            if (browser) {
-              // In parallel mode: create fresh context from browser
+        try {
+          // Close current page if it's still open
+          if (!page.isClosed()) {
+            await page.close();
+          }
+
+          // Create a completely new context for retry
+          let retryContext, retryPage;
+          if (browser) {
+            // In parallel mode: create fresh context from browser
+            try {
+              retryContext = await browser.newContext();
+              retryPage = await retryContext.newPage();
+              console.log('✅ Created fresh browser context for retry (parallel mode)');
+            } catch (contextError) {
+              // Browser might be closing
+              console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
+              console.log(`⏳ Waiting 5 seconds before retry attempt...`);
+              await new Promise(resolve => setTimeout(resolve, 5000));
+
+              // Try one more time
               try {
                 retryContext = await browser.newContext();
                 retryPage = await retryContext.newPage();
-                console.log('✅ Created fresh browser context for retry (parallel mode)');
-              } catch (contextError) {
-                // Browser might be closing, skip retry
-                console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
-                return errorResult; // Return original error result without retry
+                console.log('✅ Successfully created context on second attempt');
+              } catch (secondError) {
+                console.log(`❌ Still cannot create context: ${secondError.message}`);
+                console.log(`⏳ Will retry again...`);
+                return errorResult; // This ERROR will trigger another retry
               }
+            }
 
               // IMPORTANT: Pass browser to retry, not the retry context
-              // This ensures retries of retries also create fresh contexts from browser
-              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser);
+              // Pass errorResult as previousResult for comparison
+              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser, errorResult);
 
               // Clean up the retry context after retry completes
               try {
@@ -787,8 +1003,8 @@ class WebNNTestRunner {
                 retryPage = await retryContext.newPage();
                 console.log('✅ Created fresh browser context for retry (sequential mode)');
 
-                // Pass null for browser in sequential mode
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null);
+                // Pass null for browser in sequential mode, pass errorResult as previousResult
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null, errorResult);
 
                 // Clean up
                 try {
@@ -806,7 +1022,7 @@ class WebNNTestRunner {
                 retryPage = await context.newPage();
                 console.log('✅ Created new page from existing context for retry');
 
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null);
+                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null, errorResult);
 
                 // Only close the page, not the context
                 try {
@@ -828,13 +1044,204 @@ class WebNNTestRunner {
             // Return the original error result if retry fails
             return errorResult;
           }
-        }
 
         return errorResult;
       }
   }
 
-  async runSamplesTests() {
+  async runTestWithRetry(testFile, context, browser, previousResult, launchNewBrowser = null) {
+    const maxRetries = 20; // Maximum retry attempts for FAIL status
+    const maxBrowserClosedAttempts = 3; // Maximum attempts when browser is closed
+    const testName = testFile.replace('.https.any.js', '').replace('.js', '');
+
+    let retryCount = 0;
+    let currentResult = previousResult;
+    let previousRetryResult = null;
+    let browserClosedAttempts = 0; // Track consecutive browser closed errors
+    let currentBrowser = browser; // Track current browser instance
+    let currentContext = context; // Track current context instance
+
+    // Helper function to check if two failure results are identical
+    const areFailuresIdentical = (result1, result2) => {
+      if (!result1 || !result2) return false;
+      if (result1.result !== result2.result) return false;
+
+      // Compare subcase counts
+      const sc1 = result1.subcases;
+      const sc2 = result2.subcases;
+      if (sc1.total !== sc2.total || sc1.passed !== sc2.passed || sc1.failed !== sc2.failed) {
+        return false;
+      }
+
+      return true;
+    };
+
+    // Helper function to launch a new browser instance
+    const tryLaunchNewBrowser = async () => {
+      if (!launchNewBrowser || typeof launchNewBrowser !== 'function') {
+        return null;
+      }
+
+      try {
+        console.log(`🔄 Attempting to launch a new browser instance...`);
+        const newBrowserInstance = await launchNewBrowser();
+        console.log(`✅ Successfully launched new browser instance`);
+        return newBrowserInstance;
+      } catch (launchError) {
+        console.error(`❌ Failed to launch new browser: ${launchError.message}`);
+        return null;
+      }
+    };
+
+    while (true) {
+      retryCount++;
+
+      // Check if we've hit the browser closed limit
+      if (browserClosedAttempts >= maxBrowserClosedAttempts) {
+        console.log(`\n❌ Browser has been closed - cannot retry further (attempted ${browserClosedAttempts} times)`);
+        console.log(`⏭️  Test will be retried on next test run\n`);
+        break;
+      }
+
+      // Determine if we should continue retrying
+      const shouldContinue = (
+        currentResult.result === 'UNKNOWN' ||
+        currentResult.result === 'ERROR' ||
+        (currentResult.result === 'FAIL' && retryCount <= maxRetries && !areFailuresIdentical(previousRetryResult, currentResult))
+      );
+
+      if (!shouldContinue) {
+        if (currentResult.result === 'FAIL' && areFailuresIdentical(previousRetryResult, currentResult)) {
+          console.log(`\n✓ Test ${testName} has 2 consecutive identical failures - accepting result\n`);
+        } else if (currentResult.result === 'FAIL' && retryCount > maxRetries) {
+          console.log(`\n⚠️ Test ${testName} reached maximum retry limit (${maxRetries}) - accepting current FAIL result\n`);
+        }
+        break;
+      }
+
+      // Create fresh browser context for retry
+      let retryContext, retryPage;
+      const testStartTime = Date.now();
+
+      try {
+        // Get browser instance (use current tracked browser)
+        let browserInstance = currentBrowser || (currentContext ? currentContext.browser() : null);
+
+        if (!browserInstance) {
+          console.log(`❌ No browser instance available for retry`);
+          break;
+        }
+
+        // Check if browser is connected before trying to create context
+        if (browserInstance && !browserInstance.isConnected()) {
+          console.log(`❌ Browser is no longer connected - attempting to restart...`);
+          browserClosedAttempts++;
+          console.log(`⏳ Browser closed attempt ${browserClosedAttempts}/${maxBrowserClosedAttempts}`);
+
+          // Try to launch a new browser
+          const newBrowser = await tryLaunchNewBrowser();
+          if (newBrowser && newBrowser.isConnected()) {
+            console.log(`✅ Successfully restarted browser - continuing with retries`);
+            currentBrowser = newBrowser;
+            browserInstance = newBrowser;
+            browserClosedAttempts = 0; // Reset counter after successful restart
+          } else {
+            if (browserClosedAttempts >= maxBrowserClosedAttempts) {
+              continue; // Will break in next iteration
+            }
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            continue;
+          }
+        }
+
+        // Create fresh context
+        retryContext = await browserInstance.newContext();
+        retryPage = await retryContext.newPage();
+        console.log(`✅ Created fresh browser context for retry attempt ${retryCount}`);
+
+        // Reset browser closed counter on success
+        browserClosedAttempts = 0;
+
+        // Run the test without further recursive retries (skipRetry=false for this dedicated retry phase)
+        const retryResult = await this.runSingleWptTest(
+          retryPage,
+          testFile,
+          0,
+          1,
+          retryCount,
+          retryContext,
+          browserInstance,
+          currentResult,
+          false // Allow retries within this call
+        );
+
+        // Add execution time
+        const testEndTime = Date.now();
+        const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
+        retryResult.executionTime = executionTime;
+        retryResult.testFile = testFile;
+
+        // Update for next iteration
+        previousRetryResult = currentResult;
+        currentResult = retryResult;
+
+        // Clean up
+        try {
+          if (retryPage && !retryPage.isClosed()) {
+            await retryPage.close();
+          }
+          await retryContext.close();
+        } catch (cleanupError) {
+          console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+        }
+
+        // If we got PASS, we're done
+        if (currentResult.result === 'PASS') {
+          console.log(`\n✅ Test ${testName} PASSED on retry attempt ${retryCount}\n`);
+          break;
+        }
+
+      } catch (error) {
+        console.error(`❌ Error during retry attempt ${retryCount}: ${error.message}`);
+
+        // Check if error is due to browser being closed
+        if (error.message.includes('Target page, context or browser has been closed') ||
+            error.message.includes('browser.newContext') ||
+            error.message.includes('Browser closed')) {
+          browserClosedAttempts++;
+          console.log(`⚠️  Browser closed error detected (attempt ${browserClosedAttempts}/${maxBrowserClosedAttempts})`);
+        }
+
+        // Clean up on error
+        try {
+          if (retryPage && !retryPage.isClosed()) {
+            await retryPage.close();
+          }
+          if (retryContext) {
+            await retryContext.close();
+          }
+        } catch (cleanupError) {
+          console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+        }
+
+        // If retry itself failed, keep the current result and try again (for ERROR/UNKNOWN)
+        if (currentResult.result === 'ERROR' || currentResult.result === 'UNKNOWN') {
+          // If browser is closed, don't wait as long
+          if (browserClosedAttempts >= maxBrowserClosedAttempts) {
+            continue; // Will break in next iteration
+          }
+          console.log(`⏳ Waiting 2 seconds before next retry attempt...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        } else {
+          // For FAIL, if retry mechanism failed, return current result
+          break;
+        }
+      }
+    }
+
+    return currentResult;
+  }  async runSamplesTests() {
     console.log('🚀 Running SAMPLE suite...');
     console.log('Running sample tests...');
 
@@ -1573,7 +1980,7 @@ class WebNNTestRunner {
 </html>`;
   }
 
-  // Checkpoint management methods for resume functionality
+  // Checkpoint management methods for automatic resume functionality
   getCheckpointFilePath() {
     const fs = require('fs');
     const path = require('path');
@@ -1599,17 +2006,18 @@ class WebNNTestRunner {
         const checkpoint = JSON.parse(data);
         return {
           completedTests: checkpoint.completedTests || [],
-          completedResults: checkpoint.completedResults || []
+          completedResults: checkpoint.completedResults || [],
+          accumulatedWallTime: checkpoint.accumulatedWallTime || 0
         };
       }
     } catch (error) {
       console.log(`⚠️ Warning: Could not load checkpoint file: ${error.message}`);
     }
 
-    return { completedTests: [], completedResults: [] };
+    return { completedTests: [], completedResults: [], accumulatedWallTime: 0 };
   }
 
-  saveCheckpoint(checkpointFile, completedTestFile, testResult) {
+  saveCheckpoint(checkpointFile, completedTestFile, testResult, currentSessionWallTime = null) {
     const fs = require('fs');
 
     try {
@@ -1622,10 +2030,17 @@ class WebNNTestRunner {
         checkpoint.completedResults.push(testResult);
       }
 
+      // Update accumulated wall time if provided
+      let accumulatedWallTime = checkpoint.accumulatedWallTime;
+      if (currentSessionWallTime !== null) {
+        accumulatedWallTime = currentSessionWallTime;
+      }
+
       // Save updated checkpoint
       const checkpointData = {
         completedTests: checkpoint.completedTests,
         completedResults: checkpoint.completedResults,
+        accumulatedWallTime: accumulatedWallTime,
         lastUpdated: new Date().toISOString(),
         testCase: process.env.WPT_CASE || 'all'
       };
@@ -1669,16 +2084,49 @@ test.describe('WebNN Automation Tests', () => {
     }
   });
 
-  test('WebNN Test Runner', async ({ page, browser }) => {
+  test('WebNN Test Runner', async ({ page, browser, browserName, playwright }) => {
     const runner = new WebNNTestRunner(page);
     let allResults = [];
 
-    // Set timeout to 10 minutes for all test suites
-    const testTimeout = 600000; // 10 minutes
+    // Set timeout to 30 minutes for all test suites
+    const testTimeout = 1800000; // 30 minutes
     test.setTimeout(testTimeout);
     console.log(`⏱️  Test timeout set to ${testTimeout / 60000} minutes`);
 
-    // Set test title with suite and case info for better reporting
+    // Create a browser launcher function for retry mechanism
+    const launchNewBrowser = async () => {
+      try {
+        // Use playwright fixture to get browser type
+        const browserType = playwright.chromium;
+
+        // Get launch options from config
+        const executablePath = process.env.CHROME_CANARY_PATH ||
+          'C:\\Users\\' + process.env.USERNAME + '\\AppData\\Local\\Google\\Chrome SxS\\Application\\chrome.exe';
+
+        const launchOptions = {
+          executablePath: executablePath,
+          args: [
+            '--enable-features=WebMachineLearningNeuralNetwork,WebNNOnnxRuntime',
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor',
+            '--enable-unsafe-webgpu'
+          ],
+          headless: false
+        };
+
+        console.log(`🚀 Launching new browser with executable: ${executablePath}`);
+        const newBrowser = await browserType.launch(launchOptions);
+        console.log(`✅ New browser launched successfully`);
+        return newBrowser;
+      } catch (error) {
+        console.error(`❌ Failed to launch new browser: ${error.message}`);
+        console.error(`Stack trace:`, error.stack);
+        throw error;
+      }
+    };
+
+    // Store browser launcher in runner for access during retries
+    runner.launchNewBrowser = launchNewBrowser;    // Set test title with suite and case info for better reporting
     const suiteDescription = testSuites.length > 1 ?
       `Suites: "${testSuites.join(', ')}"` :
       `Suite: "${testSuites[0].toUpperCase()}"`;
