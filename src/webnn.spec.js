@@ -59,6 +59,22 @@ class WebNNTestRunner {
       testCases = testCaseFilter.split(',').map(c => c.trim()).filter(c => c.length > 0);
     }
 
+    // Parse --wpt-range from environment variable (set by test.js wrapper)
+    // Usage: --wpt-range 0-9 or --wpt-range 5-15
+    const rangeValue = process.env.WPT_RANGE;
+    let rangeMin = null;
+    let rangeMax = null;
+    if (rangeValue) {
+      const rangeMatch = rangeValue.match(/^(\d+)-(\d+)$/);
+      if (rangeMatch) {
+        rangeMin = parseInt(rangeMatch[1], 10);
+        rangeMax = parseInt(rangeMatch[2], 10);
+        console.log(`📊 Range filter: Running test cases ${rangeMin} to ${rangeMax} (inclusive)`);
+      } else {
+        console.log(`⚠️  Invalid range format: "${rangeValue}". Expected format: min-max (e.g., 0-9)`);
+      }
+    }
+
     // Get jobs configuration
     const jobs = parseInt(process.env.JOBS || '1', 10);
     const isParallel = jobs > 1;
@@ -113,6 +129,24 @@ class WebNNTestRunner {
       }
     } else {
       console.log(`Found ${testFiles.length} test files:`, testFiles);
+    }
+
+    // Apply range filter if specified (applies after test case selection)
+    if (rangeMin !== null && rangeMax !== null) {
+      const originalLength = testFiles.length;
+      // Ensure range is valid
+      const actualMin = Math.max(0, rangeMin);
+      const actualMax = Math.min(testFiles.length - 1, rangeMax);
+
+      if (actualMin <= actualMax && actualMin < testFiles.length) {
+        testFiles = testFiles.slice(actualMin, actualMax + 1); // +1 because slice end is exclusive
+        console.log(`📊 Applied range filter [${actualMin}-${actualMax}]: Selected ${testFiles.length} of ${originalLength} test file(s)`);
+        console.log(`   Test files in range:`, testFiles.map((f, i) => `${actualMin + i}: ${f}`));
+      } else {
+        console.log(`⚠️  Range [${rangeMin}-${rangeMax}] is out of bounds for ${originalLength} test file(s)`);
+        console.log(`   Valid range: 0-${originalLength - 1}`);
+        testFiles = []; // No tests to run
+      }
     }
 
     // Initialize variables for tracking within this run session
@@ -1054,8 +1088,8 @@ class WebNNTestRunner {
       total: previousResult.subcases.total
     }];
 
-    // Helper function to check if two failure results are identical
-    const areFailuresIdentical = (result1, result2) => {
+    // Helper function to check if two results are identical (works for both PASS and FAIL)
+    const areResultsIdentical = (result1, result2) => {
       if (!result1 || !result2) return false;
       if (result1.result !== result2.result) return false;
 
@@ -1097,14 +1131,21 @@ class WebNNTestRunner {
       }
 
       // Determine if we should continue retrying
+      // Retry conditions:
+      // 1. UNKNOWN or ERROR status -> ALWAYS retry (no limit)
+      // 2. FAIL status -> retry until 2 consecutive identical failures (up to maxRetries)
+      // 3. PASS status -> retry until 2 consecutive identical passes (to ensure stability)
       const shouldContinue = (
         currentResult.result === 'UNKNOWN' ||
         currentResult.result === 'ERROR' ||
-        (currentResult.result === 'FAIL' && retryCount <= maxRetries && !areFailuresIdentical(previousRetryResult, currentResult))
+        (currentResult.result === 'FAIL' && retryCount <= maxRetries && !areResultsIdentical(previousRetryResult, currentResult)) ||
+        (currentResult.result === 'PASS' && !areResultsIdentical(previousRetryResult, currentResult))
       );
 
       if (!shouldContinue) {
-        if (currentResult.result === 'FAIL' && areFailuresIdentical(previousRetryResult, currentResult)) {
+        if (currentResult.result === 'PASS' && areResultsIdentical(previousRetryResult, currentResult)) {
+          console.log(`\n✓ Test ${testName} has 2 consecutive identical PASS results - accepting as stable\n`);
+        } else if (currentResult.result === 'FAIL' && areResultsIdentical(previousRetryResult, currentResult)) {
           console.log(`\n✓ Test ${testName} has 2 consecutive identical failures - accepting result\n`);
         } else if (currentResult.result === 'FAIL' && retryCount > maxRetries) {
           console.log(`\n⚠️ Test ${testName} reached maximum retry limit (${maxRetries}) - accepting current FAIL result\n`);
@@ -1168,6 +1209,33 @@ class WebNNTestRunner {
           false // Allow retries within this call
         );
 
+        // Check if we should pause for this test case (configurable via --pause command line switch)
+        // Usage: node src/test.js --suite wpt --pause abs  OR  --pause "abs,add,concat"
+        // Parse --pause from environment variable (set by test.js wrapper)
+        const pauseCase = process.env.PAUSE_CASE;
+
+        if (pauseCase) {
+          const pauseCases = pauseCase.split(',').map(c => c.trim().toLowerCase()).filter(c => c.length > 0);
+          const shouldPause = pauseCases.includes(testName.toLowerCase());
+
+          if (shouldPause) {
+            console.log(`\n🛑 PAUSING for '${testName}' test case inspection...`);
+            console.log(`   ✅ Test has been executed`);
+            console.log(`   ✅ Browser context is still alive`);
+            console.log(`   ✅ Test page is still open for inspection`);
+            console.log(`   📊 Test status: ${retryResult.result}`);
+            console.log(`   📊 Subcases: ${retryResult.subcases.passed}/${retryResult.subcases.total} passed, ${retryResult.subcases.failed} failed`);
+            console.log(`   🌐 Test URL: ${retryResult.testUrl}`);
+            console.log(`\n   🔍 You can now inspect the browser and test page!`);
+            console.log(`   ⚠️  ALL TESTS STOPPED - Browser will remain open indefinitely.`);
+            console.log(`   Press Ctrl+C to exit when ready.\n`);
+
+            // Wait indefinitely - user must manually stop the process
+            // This keeps the browser page and context alive for inspection
+            await new Promise(() => {}); // This promise never resolves
+          }
+        }
+
         // Add execution time
         const testEndTime = Date.now();
         const executionTime = ((testEndTime - testStartTime) / 1000).toFixed(2);
@@ -1197,10 +1265,17 @@ class WebNNTestRunner {
           console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
         }
 
-        // If we got PASS, we're done
+        // Check if we should continue based on result
         if (currentResult.result === 'PASS') {
-          console.log(`\n✅ Test ${testName} PASSED on retry attempt ${retryCount}\n`);
-          break;
+          // For PASS, we need 2 consecutive identical passes
+          if (previousRetryResult && areResultsIdentical(previousRetryResult, currentResult)) {
+            console.log(`\n✅ Test ${testName} PASSED with 2 consecutive identical results on retry attempt ${retryCount}\n`);
+            break;
+          } else if (retryCount === 1) {
+            console.log(`\n✅ Test ${testName} PASSED on retry attempt ${retryCount} - will retry once more to confirm stability\n`);
+          } else {
+            console.log(`\n✅ Test ${testName} PASSED on retry attempt ${retryCount} - results differ from previous, will retry to confirm\n`);
+          }
         }
 
       } catch (error) {
@@ -2183,10 +2258,10 @@ test.describe('WebNN Automation Tests', () => {
     const runner = new WebNNTestRunner(page);
     let allResults = [];
 
-    // Set timeout to 30 minutes for all test suites
-    const testTimeout = 1800000; // 30 minutes
-    test.setTimeout(testTimeout);
-    console.log(`⏱️  Test timeout set to ${testTimeout / 60000} minutes`);
+    // Set timeout to 0 (infinite) to allow for manual debugging pauses
+    // This is especially important for the 'abs' test case which pauses indefinitely
+    test.setTimeout(0);
+    console.log(`⏱️  Test timeout set to infinite (0) for debugging support`);
 
     // Create a browser launcher function for retry mechanism
     const launchNewBrowser = async () => {

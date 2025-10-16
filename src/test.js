@@ -52,6 +52,20 @@ if (previewCaseIndex !== -1 && previewCaseIndex + 1 < args.length) {
   testCase = args[previewCaseIndex + 1];
 }
 
+// Find --wpt-range argument
+const wptRangeIndex = args.findIndex(arg => arg === '--wpt-range');
+let wptRange = null;
+if (wptRangeIndex !== -1 && wptRangeIndex + 1 < args.length) {
+  wptRange = args[wptRangeIndex + 1];
+}
+
+// Find --pause argument
+const pauseIndex = args.findIndex(arg => arg === '--pause');
+let pauseCase = null;
+if (pauseIndex !== -1 && pauseIndex + 1 < args.length) {
+  pauseCase = args[pauseIndex + 1];
+}
+
 // Find --ep argument
 epFlag = args.includes('--ep');
 
@@ -68,6 +82,12 @@ if (invalidSuites.length > 0) {
 console.log(`Running WebNN tests for suite(s): ${testSuite}`);
 if (testCase) {
   console.log(`Running specific case: ${testCase}`);
+}
+if (wptRange) {
+  console.log(`📊 Range filter: Running test cases ${wptRange}`);
+}
+if (pauseCase) {
+  console.log(`🛑 Pause enabled for case(s): ${pauseCase}`);
 }
 if (jobs > 1) {
   console.log(`Parallel execution enabled: ${jobs} job(s)`);
@@ -99,6 +119,14 @@ if (testCase) {
 }
 process.env.EP_FLAG = epFlag ? 'true' : 'false';
 process.env.JOBS = jobs.toString();
+
+// Pass --wpt-range and --pause as environment variables
+if (wptRange) {
+  process.env.WPT_RANGE = wptRange;
+}
+if (pauseCase) {
+  process.env.PAUSE_CASE = pauseCase;
+}
 
 // Helper function to clear checkpoint directory
 function clearCheckpointDirectory() {
@@ -149,29 +177,66 @@ function runTestIteration(iteration, totalIterations) {
 
     // Run Playwright test with config path
     const configPath = path.join(__dirname, '..', 'playwright.config.js');
+
+    // Filter out our custom options that we've already processed
+    const customOptions = [
+      '--suite', testSuite,
+      '--wpt-case', testCase,
+      '--sample-case', testCase,
+      '--preview-case', testCase,
+      '--wpt-range', wptRange,
+      '--pause', pauseCase,
+      '--ep',
+      '--jobs', jobs.toString(),
+      '--repeat', repeat.toString()
+    ];
+
+    const filteredArgs = args.filter(arg => {
+      // Check if this arg is in our custom options list
+      const argIndex = customOptions.indexOf(arg);
+      if (argIndex !== -1) return false;
+
+      // Also check if previous arg was an option expecting a value
+      const argPosition = args.indexOf(arg);
+      if (argPosition > 0) {
+        const prevArg = args[argPosition - 1];
+        if (prevArg === '--suite' ||
+            prevArg === '--wpt-case' ||
+            prevArg === '--sample-case' ||
+            prevArg === '--preview-case' ||
+            prevArg === '--wpt-range' ||
+            prevArg === '--pause' ||
+            prevArg === '--jobs' ||
+            prevArg === '--repeat') {
+          return false; // This is a value for a custom option, skip it
+        }
+      }
+
+      return true;
+    });
+
     const playwrightArgs = [
       'test',
       `--config=${configPath}`,
-      '--project=chromium-canary',
-      ...args.filter(arg =>
-        arg !== '--suite' &&
-        arg !== testSuite &&
-        arg !== '--wpt-case' &&
-        arg !== '--sample-case' &&
-        arg !== '--preview-case' &&
-        arg !== testCase &&
-        arg !== '--ep' &&
-        arg !== '--jobs' &&
-        arg !== jobs.toString() &&
-        arg !== '--repeat' &&
-        arg !== repeat.toString()
-      ) // Remove suite-specific arguments
+      '--project=chromium-canary'
     ];
+
+    // Only add filtered args if there are any
+    // Don't add them if they're empty to avoid confusing Playwright
+    if (filteredArgs.length > 0) {
+      playwrightArgs.push(...filteredArgs);
+    }
+
+    // Note: We don't pass --wpt-range and --pause to Playwright
+    // The test code reads them directly from process.argv
+    // We need to preserve the original args in the spawned process
 
     const playwrightProcess = spawn('npx', ['playwright', ...playwrightArgs], {
       stdio: 'inherit',
       shell: true,
-      env: { ...process.env }
+      env: { ...process.env },
+      // Pass original process.argv so test code can read --wpt-range and --pause
+      // This is inherited automatically through the shell
     });
 
     playwrightProcess.on('close', (code) => {
