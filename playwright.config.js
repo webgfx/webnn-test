@@ -21,7 +21,8 @@ export default defineConfig({
     ['html', {
       open: 'never',
       outputFolder: 'report-temp'
-    }]
+    }],
+    ['list']  // Use list reporter to suppress default HTML report messages
   ],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
@@ -31,19 +32,24 @@ export default defineConfig({
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
     
-    /* Make browser visible during test execution */
+    /* Make browser visible during test execution and retries */
     headless: false,
+    
+    /* Use full window size for all tests including retries */
+    viewport: null,
   },  /* Configure projects for major browsers */
   projects: [
     {
-      name: 'chromium-canary',
+      name: 'webnn-tests',
       use: {
         // Use Chrome with WebNN features enabled
-        viewport: null,  // Use full window size
         channel: process.env.CHROME_CHANNEL || 'chrome',
         launchOptions: {
           args: [
             '--enable-features=WebMachineLearningNeuralNetwork,WebNNOnnxRuntime',
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor',
+            '--enable-unsafe-webgpu',
             '--start-maximized'
           ]
         }

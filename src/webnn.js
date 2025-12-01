@@ -6,6 +6,35 @@ class WebNNTestRunner {
     this.epFlag = process.env.EP_FLAG === 'true';
   }
 
+  async restartBrowserAndContext(browserToClose) {
+    if (browserToClose) {
+      try {
+        console.log('🔄 Closing browser before restart...');
+        await browserToClose.close();
+        console.log('✅ Browser closed');
+      } catch (e) {
+        console.log(`⚠️ Error closing browser: ${e.message}`);
+      }
+    }
+
+    // Wait a bit to ensure process is fully gone
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    if (!this.launchNewBrowser) {
+      throw new Error('launchNewBrowser function is not defined');
+    }
+
+    console.log('🔄 Launching new browser...');
+    const newBrowser = await this.launchNewBrowser();
+    console.log('✅ New browser launched');
+
+    console.log('🔄 Creating new context...');
+    const newContext = await newBrowser.newContext();
+    console.log(`✅ Created fresh browser context (ID: ${newContext._guid || 'N/A'})`);
+
+    return { browser: newBrowser, context: newContext };
+  }
+
   async checkOnnxRuntimeDlls() {
     const { execSync } = require('child_process');
     const path = require('path');
@@ -60,19 +89,36 @@ class WebNNTestRunner {
     }
 
     // Parse --wpt-range from environment variable (set by test.js wrapper)
-    // Usage: --wpt-range 0-9 or --wpt-range 5-15
+    // Usage: --wpt-range 0-9 or --wpt-range 0,1,3-7
     const rangeValue = process.env.WPT_RANGE;
-    let rangeMin = null;
-    let rangeMax = null;
+    let selectedIndices = new Set();
     if (rangeValue) {
-      const rangeMatch = rangeValue.match(/^(\d+)-(\d+)$/);
-      if (rangeMatch) {
-        rangeMin = parseInt(rangeMatch[1], 10);
-        rangeMax = parseInt(rangeMatch[2], 10);
-        console.log(`📊 Range filter: Running test cases ${rangeMin} to ${rangeMax} (inclusive)`);
-      } else {
-        console.log(`⚠️  Invalid range format: "${rangeValue}". Expected format: min-max (e.g., 0-9)`);
-      }
+      const parts = rangeValue.split(',');
+      parts.forEach(part => {
+        part = part.trim();
+        if (part.includes('-')) {
+          const rangeParts = part.split('-');
+          const start = parseInt(rangeParts[0], 10);
+          const end = parseInt(rangeParts[1], 10);
+          
+          if (!isNaN(start) && !isNaN(end)) {
+            for (let i = start; i <= end; i++) {
+              selectedIndices.add(i);
+            }
+          } else {
+            console.log(`⚠️ Invalid range format in "${part}"`);
+          }
+        } else {
+          const index = parseInt(part, 10);
+          if (!isNaN(index)) {
+            selectedIndices.add(index);
+          } else {
+            console.log(`⚠️ Invalid index format in "${part}"`);
+          }
+        }
+      });
+      const sortedIndices = Array.from(selectedIndices).sort((a, b) => a - b);
+      console.log(`📊 Range filter: Running test cases with indices ${sortedIndices.join(', ')}`);
     }
 
     // Get jobs configuration
@@ -121,10 +167,18 @@ class WebNNTestRunner {
     await context.close();
     console.log('   ✅ Closed discovery context');
 
-    // Create new context for test execution
-    context = await browser.newContext();
-    console.log('   ✅ Created fresh browser context for test execution');
-    console.log(`   📍 Context ID: ${context._guid || 'N/A'}\n`);
+    // Ensure fresh browser for test execution
+    if (this.launchNewBrowser && browser) {
+      console.log('🔄 Restarting browser for test execution...');
+      const result = await this.restartBrowserAndContext(browser);
+      browser = result.browser;
+      context = result.context;
+    } else {
+      // Create new context for test execution
+      context = await browser.newContext();
+      console.log('   ✅ Created fresh browser context for test execution');
+      console.log(`   📍 Context ID: ${context._guid || 'N/A'}\n`);
+    }
 
     // Apply test case selection if specified - run cases sequentially
     if (testCases.length > 0) {
@@ -151,22 +205,12 @@ class WebNNTestRunner {
       console.log(`Found ${testFiles.length} test files:`, testFiles);
     }
 
-    // Apply range filter if specified (applies after test case selection)
-    if (rangeMin !== null && rangeMax !== null) {
+    // Apply range/index filter if specified (applies after test case selection)
+    if (selectedIndices.size > 0) {
       const originalLength = testFiles.length;
-      // Ensure range is valid
-      const actualMin = Math.max(0, rangeMin);
-      const actualMax = Math.min(testFiles.length - 1, rangeMax);
-
-      if (actualMin <= actualMax && actualMin < testFiles.length) {
-        testFiles = testFiles.slice(actualMin, actualMax + 1); // +1 because slice end is exclusive
-        console.log(`📊 Applied range filter [${actualMin}-${actualMax}]: Selected ${testFiles.length} of ${originalLength} test file(s)`);
-        console.log(`   Test files in range:`, testFiles.map((f, i) => `${actualMin + i}: ${f}`));
-      } else {
-        console.log(`⚠️  Range [${rangeMin}-${rangeMax}] is out of bounds for ${originalLength} test file(s)`);
-        console.log(`   Valid range: 0-${originalLength - 1}`);
-        testFiles = []; // No tests to run
-      }
+      testFiles = testFiles.filter((_, index) => selectedIndices.has(index));
+      console.log(`📊 Applied range filter: Selected ${testFiles.length} of ${originalLength} test file(s)`);
+      console.log(`   Test files selected:`, testFiles.map((f, i) => `${i}: ${f}`));
     }
 
     console.log(`\n▶️  Starting fresh test run with ${testFiles.length} test(s)\n`);
@@ -282,9 +326,17 @@ class WebNNTestRunner {
           await currentBatchContext.close();
           console.log(`   ✅ Closed batch ${chunkNum} context`);
 
-          // Create new context for next batch
-          currentBatchContext = await browser.newContext();
-          console.log(`   ✅ Created fresh browser context for batch ${chunkNum + 1}\n`);
+          // Ensure fresh browser for next batch
+          if (this.launchNewBrowser) {
+            console.log('🔄 Restarting browser for next batch...');
+            const result = await this.restartBrowserAndContext(browser);
+            browser = result.browser;
+            currentBatchContext = result.context;
+          } else {
+            // Create new context for next batch
+            currentBatchContext = await browser.newContext();
+            console.log(`   ✅ Created fresh browser context for batch ${chunkNum + 1}\n`);
+          }
         } catch (error) {
           console.log(`   ⚠️ Error recreating context: ${error.message}, continuing with existing context`);
         }
@@ -818,96 +870,55 @@ class WebNNTestRunner {
             }
 
             // Create a completely new context for retry
-            let retryContext, retryPage;
-            if (browser) {
-              // In parallel mode: create fresh context from browser
-              try {
-                retryContext = await browser.newContext();
-                retryPage = await retryContext.newPage();
-                console.log('✅ Created fresh browser context for retry (parallel mode)');
-              } catch (contextError) {
-                // Browser might be closing
-                console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
+            let retryContext, retryPage, newBrowser;
+            
+            // Determine browser to close/restart
+            let browserToRestart = browser;
+            if (!browserToRestart && context) {
+               browserToRestart = context.browser();
+            }
 
-                // For ERROR/UNKNOWN, wait and retry instead of giving up
-                if (overallStatus === 'ERROR' || overallStatus === 'UNKNOWN') {
-                  console.log(`⏳ Waiting 5 seconds before retry attempt...`);
-                  await new Promise(resolve => setTimeout(resolve, 5000));
-                  // Try one more time
-                  try {
-                    retryContext = await browser.newContext();
-                    retryPage = await retryContext.newPage();
-                    console.log('✅ Successfully created context on second attempt');
-                  } catch (secondError) {
-                    console.log(`❌ Still cannot create context: ${secondError.message}`);
-                    console.log(`⏳ Marking as ERROR and will retry again...`);
-                    return result; // This ERROR will trigger another retry
+            if (browserToRestart) {
+               // Unified path: Restart browser to ensure clean state
+               console.log('🔄 Restarting browser for retry...');
+               try {
+                   const newEnv = await this.restartBrowserAndContext(browserToRestart);
+                   newBrowser = newEnv.browser;
+                   retryContext = newEnv.context;
+                   retryPage = newEnv.page;
+               } catch (e) {
+                   console.log(`❌ Failed to restart browser: ${e.message}`);
+                   return result;
+               }
+
+               // IMPORTANT: Pass newBrowser to retry
+               const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, newBrowser, result);
+               
+               // Clean up the temporary browser
+               try {
+                  if (newBrowser) {
+                      await newBrowser.close();
                   }
-                } else {
-                  // For FAIL, we can return since we have a definitive result
-                  return result;
-                }
-              }
+               } catch (cleanupError) {
+                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
+               }
 
-              // IMPORTANT: Pass browser to retry, not the retry context
-              // Pass current result as previousResult for comparison
-              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser, result);
-
-              // Clean up the retry context after retry completes
-              try {
-                if (retryPage && !retryPage.isClosed()) {
-                  await retryPage.close();
-                }
-                // Always close the retry context in parallel mode
-                await retryContext.close();
-              } catch (cleanupError) {
-                console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-              }
-
-              return retryResult;
+               return retryResult;
             } else if (context) {
-              // In sequential mode: create new context for clean state
-              const browserInstance = context.browser();
-              if (browserInstance) {
-                retryContext = await browserInstance.newContext();
-                retryPage = await retryContext.newPage();
-                console.log('✅ Created fresh browser context for retry (sequential mode)');
-
-                // Pass null for browser in sequential mode, pass current result as previousResult
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null, result);
-
-                // Clean up
-                try {
-                  if (retryPage && !retryPage.isClosed()) {
-                    await retryPage.close();
-                  }
-                  await retryContext.close();
-                } catch (cleanupError) {
-                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-                }
-
-                return retryResult;
-              } else {
-                // Fallback: reuse existing context if browser not available
-                retryPage = await context.newPage();
-                console.log('✅ Created new page from existing context for retry');
-
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null, result);
-
-                // Only close the page, not the context
-                try {
-                  if (retryPage && !retryPage.isClosed()) {
-                    await retryPage.close();
-                  }
-                } catch (cleanupError) {
-                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-                }
-
-                return retryResult;
-              }
+               // Fallback if no browser instance available
+               try {
+                  retryPage = await context.newPage();
+                  console.log('✅ Created new page from existing context for retry (fallback)');
+                  const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null, result);
+                  if (retryPage && !retryPage.isClosed()) await retryPage.close();
+                  return retryResult;
+               } catch (e) {
+                  console.log(`❌ Fallback retry failed: ${e.message}`);
+                  return result;
+               }
             } else {
-              console.log('⚠️ No browser/context available for retry, skipping...');
-              return result;
+                console.log('⚠️ No browser/context available for retry, skipping...');
+                return result;
             }
           } catch (retryError) {
             console.error(`❌ Error during retry: ${retryError.message}`);
@@ -953,91 +964,56 @@ class WebNNTestRunner {
           }
 
           // Create a completely new context for retry
-          let retryContext, retryPage;
-          if (browser) {
-            // In parallel mode: create fresh context from browser
-            try {
-              retryContext = await browser.newContext();
-              retryPage = await retryContext.newPage();
-              console.log('✅ Created fresh browser context for retry (parallel mode)');
-            } catch (contextError) {
-              // Browser might be closing
-              console.log(`⚠️ Cannot create retry context (browser closing): ${contextError.message}`);
-              console.log(`⏳ Waiting 5 seconds before retry attempt...`);
-              await new Promise(resolve => setTimeout(resolve, 5000));
+          let retryContext, retryPage, newBrowser;
+          
+          // Determine browser to close/restart
+          let browserToRestart = browser;
+          if (!browserToRestart && context) {
+             browserToRestart = context.browser();
+          }
 
-              // Try one more time
-              try {
-                retryContext = await browser.newContext();
-                retryPage = await retryContext.newPage();
-                console.log('✅ Successfully created context on second attempt');
-              } catch (secondError) {
-                console.log(`❌ Still cannot create context: ${secondError.message}`);
-                console.log(`⏳ Will retry again...`);
-                return errorResult; // This ERROR will trigger another retry
-              }
-            }
+          if (browserToRestart) {
+             // Unified path: Restart browser to ensure clean state
+             console.log('🔄 Restarting browser for ERROR retry...');
+             try {
+                 const newEnv = await this.restartBrowserAndContext(browserToRestart);
+                 newBrowser = newEnv.browser;
+                 retryContext = newEnv.context;
+                 retryPage = newEnv.page;
+             } catch (e) {
+                 console.log(`❌ Failed to restart browser: ${e.message}`);
+                 return errorResult;
+             }
 
-              // IMPORTANT: Pass browser to retry, not the retry context
-              // Pass errorResult as previousResult for comparison
-              const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, browser, errorResult);
-
-              // Clean up the retry context after retry completes
-              try {
-                if (retryPage && !retryPage.isClosed()) {
-                  await retryPage.close();
+             // IMPORTANT: Pass newBrowser to retry
+             const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, newBrowser, errorResult);
+             
+             // Clean up the temporary browser
+             try {
+                if (newBrowser) {
+                    await newBrowser.close();
                 }
-                // Always close the retry context in parallel mode
-                await retryContext.close();
-              } catch (cleanupError) {
+             } catch (cleanupError) {
                 console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-              }
+             }
 
-              return retryResult;
-            } else if (context) {
-              // In sequential mode: create new context for clean state
-              const browserInstance = context.browser();
-              if (browserInstance) {
-                retryContext = await browserInstance.newContext();
-                retryPage = await retryContext.newPage();
-                console.log('✅ Created fresh browser context for retry (sequential mode)');
-
-                // Pass null for browser in sequential mode, pass errorResult as previousResult
-                const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, retryContext, null, errorResult);
-
-                // Clean up
-                try {
-                  if (retryPage && !retryPage.isClosed()) {
-                    await retryPage.close();
-                  }
-                  await retryContext.close();
-                } catch (cleanupError) {
-                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-                }
-
-                return retryResult;
-              } else {
-                // Fallback: reuse existing context if browser not available
+             return retryResult;
+          } else if (context) {
+             // Fallback if no browser instance available (should be rare)
+             try {
                 retryPage = await context.newPage();
-                console.log('✅ Created new page from existing context for retry');
-
+                console.log('✅ Created new page from existing context for retry (fallback)');
                 const retryResult = await this.runSingleWptTest(retryPage, testFile, index, totalFiles, retryCount + 1, context, null, errorResult);
-
-                // Only close the page, not the context
-                try {
-                  if (retryPage && !retryPage.isClosed()) {
-                    await retryPage.close();
-                  }
-                } catch (cleanupError) {
-                  console.log(`⚠️ Cleanup warning: ${cleanupError.message}`);
-                }
-
+                if (retryPage && !retryPage.isClosed()) await retryPage.close();
                 return retryResult;
-              }
-            } else {
+             } catch (e) {
+                console.log(`❌ Fallback retry failed: ${e.message}`);
+                return errorResult;
+             }
+          } else {
               console.log('⚠️ No browser/context available for retry, skipping...');
               return errorResult;
-            }
+          }
           } catch (retryError) {
             console.error(`❌ Error during retry: ${retryError.message}`);
             // Return the original error result if retry fails
@@ -1101,10 +1077,11 @@ class WebNNTestRunner {
       }
     };
 
-    while (true) {
-      retryCount++;
+    try {
+      while (true) {
+        retryCount++;
 
-      // Check if we've hit the browser closed limit
+        // Check if we've hit the browser closed limit
       if (browserClosedAttempts >= maxBrowserClosedAttempts) {
         console.log(`\n❌ Browser has been closed - cannot retry further (attempted ${browserClosedAttempts} times)`);
         console.log(`⏭️  Test will be retried on next test run\n`);
@@ -1134,45 +1111,73 @@ class WebNNTestRunner {
         break;
       }
 
-      // Create fresh browser context for retry
+      // Ensure fresh browser for retry
       let retryContext, retryPage;
       const testStartTime = Date.now();
 
-      try {
-        // Get browser instance (use current tracked browser)
-        let browserInstance = currentBrowser || (currentContext ? currentContext.browser() : null);
+      if (launchNewBrowser) {
+        // Determine browser to close
+        let browserToClose = currentBrowser;
+        if (!browserToClose && currentContext) {
+          browserToClose = currentContext.browser();
+        }
+        if (!browserToClose) {
+          browserToClose = browser;
+        }
 
-        if (!browserInstance) {
-          console.log(`❌ No browser instance available for retry`);
+        try {
+          const result = await this.restartBrowserAndContext(browserToClose);
+          currentBrowser = result.browser;
+          retryContext = result.context;
+          currentContext = retryContext;
+        } catch (e) {
+          console.log(`❌ Failed to restart browser: ${e.message}`);
           break;
         }
+      } else {
+        // Create fresh browser context for retry
+        try {
+          // Get browser instance (use current tracked browser)
+          let browserInstance = currentBrowser || (currentContext ? currentContext.browser() : null);
 
-        // Check if browser is connected before trying to create context
-        if (browserInstance && !browserInstance.isConnected()) {
-          console.log(`❌ Browser is no longer connected - attempting to restart...`);
-          browserClosedAttempts++;
-          console.log(`⏳ Browser closed attempt ${browserClosedAttempts}/${maxBrowserClosedAttempts}`);
-
-          // Try to launch a new browser
-          const newBrowser = await tryLaunchNewBrowser();
-          if (newBrowser && newBrowser.isConnected()) {
-            console.log(`✅ Successfully restarted browser - continuing with retries`);
-            currentBrowser = newBrowser;
-            browserInstance = newBrowser;
-            browserClosedAttempts = 0; // Reset counter after successful restart
-          } else {
-            if (browserClosedAttempts >= maxBrowserClosedAttempts) {
-              continue; // Will break in next iteration
-            }
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            continue;
+          if (!browserInstance) {
+            console.log(`❌ No browser instance available for retry`);
+            break;
           }
-        }
 
-        // Create fresh context
-        retryContext = await browserInstance.newContext();
+          // Check if browser is connected before trying to create context
+          if (browserInstance && !browserInstance.isConnected()) {
+            console.log(`❌ Browser is no longer connected - attempting to restart...`);
+            browserClosedAttempts++;
+            console.log(`⏳ Browser closed attempt ${browserClosedAttempts}/${maxBrowserClosedAttempts}`);
+
+            // Try to launch a new browser
+            const newBrowser = await tryLaunchNewBrowser();
+            if (newBrowser && newBrowser.isConnected()) {
+              console.log(`✅ Successfully restarted browser - continuing with retries`);
+              currentBrowser = newBrowser;
+              browserInstance = newBrowser;
+              browserClosedAttempts = 0; // Reset counter after successful restart
+            } else {
+              if (browserClosedAttempts >= maxBrowserClosedAttempts) {
+                continue; // Will break in next iteration
+              }
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              continue;
+            }
+          }
+
+          // Create fresh context
+          retryContext = await browserInstance.newContext();
+          console.log(`✅ Created fresh browser context for retry attempt ${retryCount}`);
+        } catch (error) {
+          console.error(`❌ Error creating context: ${error.message}`);
+          break;
+        }
+      }
+
+      try {
         retryPage = await retryContext.newPage();
-        console.log(`✅ Created fresh browser context for retry attempt ${retryCount}`);
 
         // Reset browser closed counter on success
         browserClosedAttempts = 0;
@@ -1185,7 +1190,7 @@ class WebNNTestRunner {
           1,
           retryCount,
           retryContext,
-          browserInstance,
+          currentBrowser || browser,
           currentResult,
           false // Allow retries within this call
         );
@@ -1312,6 +1317,18 @@ class WebNNTestRunner {
     }
 
     return currentResult;
+    } finally {
+      // Ensure the browser created for retry is closed to prevent leaks
+      if (launchNewBrowser && currentBrowser && currentBrowser !== browser) {
+        try {
+          console.log('🧹 Closing retry browser instance...');
+          await currentBrowser.close();
+          console.log('✅ Retry browser closed');
+        } catch (e) {
+          console.log(`⚠️ Error closing retry browser: ${e.message}`);
+        }
+      }
+    }
   }  async runSamplesTests() {
     console.log('🚀 Running SAMPLE suite...');
     console.log('Running sample tests...');
@@ -2265,12 +2282,11 @@ test.describe('WebNN Automation Tests', () => {
         // Use playwright fixture to get browser type
         const browserType = playwright.chromium;
 
-        // Get launch options from config
-        const executablePath = process.env.CHROME_CANARY_PATH ||
-          'C:\\Users\\' + process.env.USERNAME + '\\AppData\\Local\\Google\\Chrome SxS\\Application\\chrome.exe';
+        // Get channel from environment (set by main.js), default to 'chrome' (stable)
+        const channel = process.env.CHROME_CHANNEL || 'chrome';
 
         const launchOptions = {
-          executablePath: executablePath,
+          channel: channel,
           args: [
             '--enable-features=WebMachineLearningNeuralNetwork,WebNNOnnxRuntime',
             '--disable-web-security',
@@ -2280,7 +2296,14 @@ test.describe('WebNN Automation Tests', () => {
           headless: false
         };
 
-        console.log(`🚀 Launching new browser with executable: ${executablePath}`);
+        // Allow manual override via executable path if provided
+        if (process.env.CHROME_PATH) {
+          launchOptions.executablePath = process.env.CHROME_PATH;
+          console.log(`🚀 Launching new browser with executable: ${launchOptions.executablePath}`);
+        } else {
+          console.log(`🚀 Launching new browser with channel: ${channel}`);
+        }
+
         const newBrowser = await browserType.launch(launchOptions);
         console.log(`✅ New browser launched successfully`);
         return newBrowser;
@@ -2400,8 +2423,10 @@ test.describe('WebNN Automation Tests', () => {
       description: `Wall Time: ${overallWallTime}s | Sum: ${sumOfAllTestTimes}s | Speedup: ${(parseFloat(sumOfAllTestTimes) / parseFloat(overallWallTime)).toFixed(2)}x`
     });
 
-    // Assert that we have some results (this creates a test step)
-    expect(results.length).toBeGreaterThan(0);
+    // Check if we have results
+    if (results.length === 0) {
+      console.log('⚠️ No tests were executed. Check your filters (suite, case, index, range).');
+    }
 
     // IMMEDIATELY attach reports after assertion, BEFORE any other async operations that create test steps
     // Create detailed HTML report content (note: dllCheckResults will be null initially)

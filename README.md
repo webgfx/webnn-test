@@ -53,6 +53,10 @@ node src/main.js --suite wpt --wpt-case abs
 
 # Run tests with names starting with "abs" OR "add"
 node src/main.js --suite wpt --wpt-case abs,add
+
+# Run specific test indices (0-based)
+node src/main.js --suite wpt --wpt-range 0,1,3-7
+# This will run tests at indices 0, 1, 3, 4, 5, 6, 7 from the discovered list
 ```
 
 The case selection is case-insensitive and matches the prefix of the test filename.

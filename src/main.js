@@ -233,7 +233,7 @@ function runTestIteration(iteration, totalIterations) {
     const playwrightArgs = [
       'test',
       `--config=${configPath}`,
-      '--project=chromium-canary'
+      '--project=webnn-tests'
     ];
 
     // Only add filtered args if there are any
