@@ -1088,23 +1088,43 @@ class WebNNTestRunner {
         break;
       }
 
+      // Check if the current result matches any previous result in history
+      const hasMatchingResultInHistory = () => {
+        if (retryHistory.length < 2) return false;
+        // Check against all previous entries (excluding the last one which is currentResult)
+        for (let i = 0; i < retryHistory.length - 1; i++) {
+          const prev = retryHistory[i];
+          if (prev.status === currentResult.result &&
+              prev.passed === currentResult.subcases.passed &&
+              prev.failed === currentResult.subcases.failed &&
+              prev.total === currentResult.subcases.total) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      const isStable = hasMatchingResultInHistory();
+
       // Determine if we should continue retrying
       // Retry conditions:
       // 1. UNKNOWN or ERROR status -> ALWAYS retry (no limit)
-      // 2. FAIL status -> retry until 2 consecutive identical failures (up to maxRetries)
-      // 3. PASS status -> retry until 2 consecutive identical passes (to ensure stability)
+      // 2. FAIL status -> retry until we see a duplicate result in history (up to maxRetries)
+      // 3. PASS status -> retry until we see a duplicate result in history (to ensure stability)
       const shouldContinue = (
         currentResult.result === 'UNKNOWN' ||
         currentResult.result === 'ERROR' ||
-        (currentResult.result === 'FAIL' && retryCount <= maxRetries && !areResultsIdentical(previousRetryResult, currentResult)) ||
-        (currentResult.result === 'PASS' && !areResultsIdentical(previousRetryResult, currentResult))
+        (currentResult.result === 'FAIL' && retryCount <= maxRetries && !isStable) ||
+        (currentResult.result === 'PASS' && !isStable)
       );
 
       if (!shouldContinue) {
-        if (currentResult.result === 'PASS' && areResultsIdentical(previousRetryResult, currentResult)) {
-          console.log(`\n✓ Test ${testName} has 2 consecutive identical PASS results - accepting as stable\n`);
-        } else if (currentResult.result === 'FAIL' && areResultsIdentical(previousRetryResult, currentResult)) {
-          console.log(`\n✓ Test ${testName} has 2 consecutive identical failures - accepting result\n`);
+        if (isStable) {
+          if (currentResult.result === 'PASS') {
+            console.log(`\n✓ Test ${testName} PASSED and matches a previous result - accepting as stable\n`);
+          } else {
+            console.log(`\n✓ Test ${testName} FAILED and matches a previous result - accepting result\n`);
+          }
         } else if (currentResult.result === 'FAIL' && retryCount > maxRetries) {
           console.log(`\n⚠️ Test ${testName} reached maximum retry limit (${maxRetries}) - accepting current FAIL result\n`);
         }
