@@ -7,6 +7,7 @@ yarn-error.log*
 # Playwright
 test-results/
 report/
+report-temp/
 playwright/.cache/
 
 # Checkpoint files (resume functionality)
@@ -41,3 +42,6 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# User data
+user-data/

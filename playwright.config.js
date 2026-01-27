@@ -5,7 +5,7 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './src',
-  testMatch: '**/webnn.js',  // Only match webnn.js test file
+  testMatch: '**/main.js',  // Only match main.js test file
   /* Test timeout - 10 minutes for WebNN tests */
   timeout: 600000, // 10 minutes
   /* Run tests in files in parallel */
@@ -22,7 +22,7 @@ export default defineConfig({
       open: 'never',
       outputFolder: 'report-temp'
     }],
-    ['list']  // Use list reporter to suppress default HTML report messages
+    ['line']  // Use line reporter to minimize console noise while keeping stdout
   ],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
@@ -31,10 +31,10 @@ export default defineConfig({
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
-    
+
     /* Make browser visible during test execution and retries */
     headless: false,
-    
+
     /* Use full window size for all tests including retries */
     viewport: null,
   },  /* Configure projects for major browsers */

@@ -2,8 +2,9 @@
   "name": "webnn-test",
   "version": "1.0.0",
   "description": "WebNN automation tests using Playwright",
-  "main": "index.js",
+  "main": "src/main.js",
   "scripts": {
+    "start": "node src/main.js",
     "test": "playwright test",
     "test:wpt": "playwright test --project=chromium-canary -- --suite=wpt",
     "test:sample": "playwright test --project=chromium-canary -- --suite=sample",
