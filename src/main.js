@@ -13,6 +13,45 @@ const { DemoRunner } = require('./demo');
 if (require.main === module) {
   // Parse command line arguments
   const args = process.argv.slice(2);
+
+  // Check for help argument
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`
+WebNN Automation Tests
+
+Usage: node src/main.js [options]
+
+Options:
+  --suite <name>           Test suite to run (default: wpt). Values: wpt, sample, demo, preview
+  --list                   List all test cases in the specified suite
+  --jobs <number>          Number of parallel jobs (default: 4)
+  --repeat <number>        Number of times to repeat the test run (default: 1)
+  --chrome-channel <name>  Chrome channel to use (default: canary). Values: stable, canary, dev, beta
+  --email [address]        Send email report to address (default: ygu@microsoft.com if no address provided)
+  --pause <case>           Pause execution on failure for specified case prefix
+
+Test Selection:
+  --wpt-case <filter>      Run specific WPT test cases (comma-separated prefix)
+  --wpt-range <range>      Run tests by index range (e.g., 0,1,3-7)
+  --sample-case <filter>   Run specific Sample cases
+  --demo-case <filter>     Run specific Demo cases
+  --preview-case <filter>  Run specific Preview cases
+
+Examples:
+  node src/main.js --suite wpt --wpt-case abs
+  node src/main.js --suite wpt --wpt-range 0-5
+  node src/main.js --suite wpt --jobs 2 --repeat 3
+`);
+    process.exit(0);
+  }
+
+  // Check for list argument
+  if (args.includes('--list')) {
+    process.env.LIST_MODE = 'true';
+  } else {
+    process.env.LIST_MODE = 'false';
+  }
+
   let testSuite = 'wpt'; // default
   let testCase = null;
   let epFlag = false;
@@ -183,6 +222,71 @@ if (require.main === module) {
   if (emailAddress) {
     process.env.EMAIL_ADDRESS = emailAddress;
     process.env.EMAIL_TO = emailAddress; // Ensure EMAIL_TO is also set for compatibility
+  }
+
+  // Handle list mode
+  if (process.env.LIST_MODE === 'true') {
+     console.log(`[Info] Listing tests for suite(s): ${testSuite}`);
+
+     // Set minimal Playwright config for listing
+     const config = {
+       use: {
+         channel: playwrightChannel,
+         headless: true
+       }
+     };
+
+     (async () => {
+         try {
+             // We need to launch browser to discover tests in some suites (like WPT)
+             const browser = await chromium.launch({ channel: playwrightChannel, headless: true });
+             const context = await browser.newContext();
+             const page = await context.newPage();
+
+             const suites = testSuite.split(',').map(s => s.trim());
+             for (const suite of suites) {
+                 console.log(`\n=== Suite: ${suite.toUpperCase()} ===`);
+
+                 if (suite === 'wpt') {
+                     const runner = new WptRunner(page);
+                     // WptRunner.runWptTests discovers tests but also runs them.
+                     // We need a way to just discover.
+                     // Since we don't have separate discovery method yet, we'll need to modify WptRunner
+                     // For now, let's assume we can access internal discovery logic or create a helper
+                     // But WPT discovery is site scraping
+                     console.log('Discovering WPT tests from https://wpt.live/webnn/conformance_tests/ ...');
+                     await page.goto('https://wpt.live/webnn/conformance_tests/');
+                     await page.waitForSelector('.file');
+                     const files = await page.$$eval('.file a', links =>
+                         links.map(l => l.textContent.trim()).filter(t => t.endsWith('.js'))
+                     );
+
+                     files.forEach((f, i) => console.log(`[${i}] ${f}`));
+                     console.log(`Total: ${files.length} tests`);
+                 }
+                 else if (suite === 'demo' || suite === 'sample') {
+                     const cases = ['lenet', 'segmentation', 'style', 'od'];
+                     console.log(`Listing ${suite.toUpperCase()} tests (Static List):`);
+                     cases.forEach((c, i) => console.log(`[${i}] ${c}`));
+                 }
+                 else if (suite === 'preview') {
+                    const cases = ['ic', 'sdxl', 'phi', 'sam', 'whisper'];
+                    console.log(`Listing ${suite.toUpperCase()} tests (Static List):`);
+                    cases.forEach((c, i) => console.log(`[${i}] ${c}`));
+                 }
+                 else {
+                    console.log(`[Warning] Listing not supported for suite: ${suite}`);
+                 }
+             }
+
+             await browser.close();
+             process.exit(0);
+         } catch (e) {
+             console.error(`Error listing tests: ${e.message}`);
+             process.exit(1);
+         }
+     })();
+     return; // Stop main execution
   }
 
   // Function to run a single test iteration
