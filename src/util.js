@@ -3,6 +3,79 @@ const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { chromium } = require('@playwright/test');
+
+async function launchBrowser() {
+    // Using flags found in current file + persistent context logic
+    const args = [
+       '--disable-gpu-watchdog',
+       //'--disable-web-security',
+       //'--ignore-certificate-errors',
+       '--enable-features=WebMachineLearningNeuralNetwork,WebNNOnnxRuntime',
+       '--webnn-ort-ignore-ep-blocklist',
+       '--ignore-gpu-blocklist',
+       //'--webnn-ort-logging-level=VERBOSE',
+   ];
+
+   if (process.env.EXTRA_BROWSER_ARGS) {
+       args.push(...process.env.EXTRA_BROWSER_ARGS.split(' '));
+   }
+
+   const launchOptions = {
+       headless: false,
+       args: args,
+       ignoreDefaultArgs: ['--disable-component-extensions-with-background-pages']
+   };
+
+   if (process.env.BROWSER_PATH) {
+       launchOptions.executablePath = process.env.BROWSER_PATH;
+   } else if (process.env.CHROME_CHANNEL) {
+       launchOptions.channel = process.env.CHROME_CHANNEL;
+   } else {
+        launchOptions.channel = 'chrome-canary'; // Default to chrome-canary
+   }
+
+   // We use a local persistent directory in the workspace.
+   const userDataDir = path.join(__dirname, '..', 'user-data');
+   if (!fs.existsSync(userDataDir)) {
+       fs.mkdirSync(userDataDir, { recursive: true });
+   }
+
+   console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
+
+   let context, page, browser;
+
+   // Use launchPersistentContext to reuse user data dir
+   try {
+       context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+       // Always create a new page for the test to avoid interference with restored tabs
+       page = await context.newPage();
+       await page.bringToFront();
+   } catch (e) {
+       console.error(`[Error] Failed to launch persistent context: ${e.message}`);
+       console.log('[Warning]  Falling back to standard launch (fresh profile)...');
+       browser = await chromium.launch(launchOptions);
+       context = await browser.newContext();
+       page = await context.newPage();
+   }
+
+   if (process.env.DEVICE) {
+       const deviceType = process.env.DEVICE;
+       await context.addInitScript((type) => {
+           if (navigator.ml && !navigator.ml.createContext._instrumented) {
+               const originalCreateContext = navigator.ml.createContext;
+               navigator.ml.createContext = async function(options) {
+                   options = options || {};
+                   options.deviceType = type;
+                   return originalCreateContext.call(navigator.ml, options);
+               };
+               navigator.ml.createContext._instrumented = true;
+           }
+       }, deviceType);
+   }
+
+   return { context, page, browser };
+}
 
 class WebNNRunner {
   constructor(page) {
@@ -507,7 +580,7 @@ class WebNNRunner {
                     <td class="pass">${result.subcases.passed}</td>
                     <td class="fail">${result.subcases.failed}</td>
                     <td class="${result.result.toLowerCase()}">${result.result === 'PASS' ? 'PASS' : result.result === 'FAIL' ? 'FAIL' : 'ERROR'}</td>
-                </tr>
+                </tr>, launchBrowser
             `).join('')}
             <tr class="summary-row">
                 <td><strong>TOTAL (${suiteTitle})</strong></td>
@@ -580,4 +653,4 @@ class WebNNRunner {
   }
 }
 
-module.exports = { WebNNRunner };
+module.exports = { WebNNRunner, launchBrowser };

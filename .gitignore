@@ -9,6 +9,7 @@ test-results/
 report/
 report-temp/
 playwright/.cache/
+playwright-report/
 
 # Checkpoint files (resume functionality)
 .checkpoint/
@@ -45,3 +46,4 @@ logs/
 
 # User data
 user-data/
+

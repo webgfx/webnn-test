@@ -8,8 +8,9 @@ const { test, expect, chromium } = require('@playwright/test');
 
 const { WptRunner } = require('./wpt');
 const { ModelRunner } = require('./model');
+const { launchBrowser } = require('./util');
 
-if (require.main === module) {
+if (require.main === module && process.env.IS_PLAYWRIGHT_CHILD_PROCESS !== 'true') {
   // Parse command line arguments
   const args = process.argv.slice(2);
 
@@ -53,7 +54,6 @@ Examples:
 
   let testSuite = 'wpt'; // default
   let testCase = null;
-  let epFlag = false;
   let jobs = 4; // default: run parallel with 4 jobs
   let repeat = 1; // default: run once
   let device = 'cpu'; // default: cpu
@@ -74,8 +74,12 @@ Examples:
     device = deviceEqArg.split('=')[1].toLowerCase();
   }
 
-  if (!['cpu', 'gpu', 'npu'].includes(device)) {
-    console.error('Invalid --device value. Must be one of: cpu, gpu, npu');
+  const devices = device.split(',').map(d => d.trim().toLowerCase());
+  const validDevices = ['cpu', 'gpu', 'npu'];
+  const invalidDevices = devices.filter(d => !validDevices.includes(d));
+
+  if (invalidDevices.length > 0) {
+    console.error(`Invalid --device value(s): ${invalidDevices.join(', ')}. Must be one of: cpu, gpu, npu`);
     process.exit(1);
   }
 
@@ -142,7 +146,7 @@ Examples:
   let chromeChannel = 'canary'; // default
   if (chromeChannelIndex !== -1 && chromeChannelIndex + 1 < args.length) {
     chromeChannel = args[chromeChannelIndex + 1].toLowerCase();
-    const validChannels = ['stable', 'canary', 'dev', 'beta'];
+    const validChannels = ['canary', 'dev', 'beta', 'stable'];
     if (!validChannels.includes(chromeChannel)) {
       console.error(`Invalid --chrome-channel value: ${chromeChannel}`);
       console.error(`Valid channels are: ${validChannels.join(', ')}`);
@@ -157,14 +161,23 @@ Examples:
     extraBrowserArgs = args[extraArgsIndex + 1];
   }
 
+  // Find --browser-path argument
+  const browserPathIndex = args.findIndex(arg => arg === '--browser-path');
+  let browserPath = null;
+  if (browserPathIndex !== -1 && browserPathIndex + 1 < args.length) {
+    browserPath = args[browserPathIndex + 1];
+  }
+
   // Map 'stable' to 'chrome' for Playwright (Playwright uses 'chrome' not 'stable')
-  const playwrightChannel = chromeChannel === 'stable' ? 'chrome' : `chrome-${chromeChannel}`;
+  let playwrightChannel;
+  if (chromeChannel === 'stable') {
+      playwrightChannel = 'chrome';
+  } else {
+      playwrightChannel = `chrome-${chromeChannel}`;
+  }
 
-  // Find --ep argument
-  epFlag = args.includes('--ep');
-
-  // Validate test suites (support comma-separated list)
-  const validSuites = ['wpt', 'model'];
+  // Validate test suite
+  let validSuites = ['wpt', 'model'];
   let suiteList = testSuite.split(',').map(s => s.trim()).filter(s => s.length > 0);
 
   // Handle 'all' keyword - expand to all supported suites
@@ -192,13 +205,13 @@ Examples:
     console.log(`[Email] Email reports will be sent to: ${emailAddress}`);
   }
   if (jobs > 1) {
-    console.log(`Parallel execution enabled: ${jobs} job(s)`);
+
+  if (browserPath) {
+    console.log(`[Browser] Custom browser path: ${browserPath}`);
+  } console.log(`Parallel execution enabled: ${jobs} job(s)`);
   }
   if (repeat > 1) {
     console.log(`[Repeat] Repeat mode enabled: Tests will run ${repeat} time(s)`);
-  }
-  if (epFlag) {
-    console.log('--ep flag detected: Browser will be kept alive for DLL inspection');
   }
   if (extraBrowserArgs) {
     console.log(`[Browser] Extra launch arguments: ${extraBrowserArgs}`);
@@ -218,12 +231,14 @@ Examples:
   if (modelCaseIndex !== -1 && modelCaseIndex + 1 < args.length) {
     process.env.MODEL_CASE = args[modelCaseIndex + 1];
   }
+  if (browserPath) {
+    process.env.BROWSER_PATH = browserPath;
+  }
 
   // Keep legacy TEST_CASE for backward compatibility
   if (testCase) {
     process.env.TEST_CASE = testCase;
   }
-  process.env.EP_FLAG = epFlag ? 'true' : 'false';
   process.env.JOBS = jobs.toString();
   process.env.CHROME_CHANNEL = playwrightChannel;
   if (extraBrowserArgs) {
@@ -319,8 +334,8 @@ Examples:
       process.env.TEST_ITERATION = iteration.toString();
       process.env.TEST_TOTAL_ITERATIONS = totalIterations.toString();
 
-      // Run Playwright test with config path
-      const configPath = path.join(__dirname, '..', 'playwright.config.js');
+      // Run Playwright test without config
+      // const configPath = path.join(__dirname, '..', 'playwright.config.js');
 
       // Filter out our custom options that we've already processed
       const customOptions = [
@@ -332,7 +347,7 @@ Examples:
         '--email', emailAddress,
         '--chrome-channel', chromeChannel,
         '--extra-browser-args', extraBrowserArgs,
-        '--ep',
+        '--browser-path', browserPath,
         '--jobs', jobs.toString(),
         '--repeat', repeat.toString(),
         '--device', device
@@ -358,6 +373,7 @@ Examples:
               prevArg === '--chrome-channel' ||
               prevArg === '--extra-browser-args' ||
               prevArg === '--jobs' ||
+              prevArg === '--browser-path' ||
               prevArg === '--repeat' ||
               prevArg === '--device') {
             return false; // This is a value for a custom option, skip it
@@ -376,9 +392,15 @@ Examples:
 
       const playwrightArgs = [
         'test',
-        `--config=${configPath}`,
-        '--project=webnn-tests'
+        '-c', path.join(__dirname, '..', 'runner.config.js'),
+        'src/main.js',
+        '--reporter=line,html',
+        '--timeout=600000'
       ];
+
+      if (process.env.CI) {
+        playwrightArgs.push('--retries=2');
+      }
 
       // Only add filtered args if there are any
       // Don't add them if they're empty to avoid confusing Playwright
@@ -390,14 +412,14 @@ Examples:
       const playwrightProcess = spawn(process.execPath, [playwrightCli, ...playwrightArgs], {
         stdio: 'inherit',
         shell: false,
-        env: { ...process.env },
+        env: { ...process.env, IS_PLAYWRIGHT_CHILD_PROCESS: 'true' },
       });
 
       playwrightProcess.on('close', (code) => {
         if (code === 0) {
           console.log(`\n[Success] ${iterationPrefix}Test iteration completed successfully`);
 
-          // Find the HTML report file (in temp directory)
+          // Find the HTML report file (in temp directory)playwright-report
           const reportTempDir = path.join(__dirname, '..', 'report-temp');
           const reportDir = path.join(__dirname, '..', 'report');
           const tempIndexFile = path.join(reportTempDir, 'index.html');
@@ -481,6 +503,7 @@ Examples:
       process.exit(typeof error === 'number' ? error : 1);
     }
   })();
+  // console.log("Debug: Entering test definition block. require.main === module is", require.main === module);
   }
 } else {
 
@@ -489,7 +512,7 @@ Examples:
 // -------------------------------------------------------------
 
 // Increase default timeout for all tests
-test.setTimeout(3600000); // 1 hour global timeout
+// test.setTimeout(3600000); // 1 hour global timeout moved to config
 
 test.describe('WebNN Tests', () => {
     let browser;
@@ -497,95 +520,11 @@ test.describe('WebNN Tests', () => {
     let page;
 
     const launchBrowserInstance = async() => {
-         // Using flags found in current file + persistent context logic
-         const args = [
-            '--disable-gpu-watchdog',
-            //'--disable-web-security',
-            //'--ignore-certificate-errors',
-            '--enable-features=WebMachineLearningNeuralNetwork,WebNNOnnxRuntime',
-            '--webnn-ort-ignore-ep-blocklist',
-            '--ignore-gpu-blocklist',
-            //'--webnn-ort-logging-level=VERBOSE',
-        ];
-
-        // Add flags consistent with original file
-        if (process.env.EP_FLAG === 'true') {
-             // Example flag, usually users supply platform specific ones
-        }
-
-        if (process.env.EXTRA_BROWSER_ARGS) {
-            args.push(...process.env.EXTRA_BROWSER_ARGS.split(' '));
-        }
-
-        const launchOptions = {
-            headless: false,
-            args: args,
-            ignoreDefaultArgs: ['--disable-component-extensions-with-background-pages']
-        };
-
-        if (process.env.BROWSER_PATH) {
-            launchOptions.executablePath = process.env.BROWSER_PATH;
-        } else if (process.env.CHROME_CHANNEL) {
-            launchOptions.channel = process.env.CHROME_CHANNEL;
-        }
-
-        const channel = process.env.CHROME_CHANNEL || 'canary';
-
-        // We use a local persistent directory in the workspace.
-        // Chrome restricts remote debugging on the system default "User Data" directory,
-        // so we cannot point directly to C:\Users\...\User Data.
-        // Using a local folder ensures model caching (persistence) works across runs.
-        const userDataDir = path.join(__dirname, '..', 'user-data');
-        if (!fs.existsSync(userDataDir)) {
-            fs.mkdirSync(userDataDir, { recursive: true });
-        }
-
-        console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
-
-        let context, page, browser;
-
-        // Use launchPersistentContext to reuse user data dir
-        try {
-            context = await chromium.launchPersistentContext(userDataDir, launchOptions);
-            // Always create a new page for the test to avoid interference with restored tabs
-            // and ensure we have a fresh, focused tab.
-            page = await context.newPage();
-
-            // Bring to front just in case
-            await page.bringToFront();
-
-        } catch (e) {
-            console.error(`[Error] Failed to launch persistent context: ${e.message}`);
-            // Fallback to standard launch if persistent fails (e.g. locked files)
-            console.log('[Warning]  Falling back to standard launch (fresh profile)...');
-            browser = await chromium.launch(launchOptions);
-            context = await browser.newContext();
-            page = await context.newPage();
-        }
-
-        if (process.env.DEVICE) {
-            const deviceType = process.env.DEVICE;
-            await context.addInitScript((type) => {
-                if (navigator.ml && !navigator.ml.createContext._instrumented) {
-                    const originalCreateContext = navigator.ml.createContext;
-                    navigator.ml.createContext = async function(options) {
-                        options = options || {};
-                        options.deviceType = type;
-                        return originalCreateContext.call(navigator.ml, options);
-                    };
-                    navigator.ml.createContext._instrumented = true;
-                }
-            }, deviceType);
-        }
-
-        return { context, page, browser };
+        return await launchBrowser();
     };
 
     test.beforeAll(async () => {
-        const instance = await launchBrowserInstance();
-        browser = instance.browser || instance.context;
-        context = instance.context;
-        page = instance.page;
+        // Browser launch deferred to test logic to handle device loops
     });
 
     test.afterAll(async () => {
@@ -609,65 +548,80 @@ test.describe('WebNN Tests', () => {
 
         let dllResults = null;
 
-        for (const [index, suite] of suites.entries()) {
-            console.log(`\n=== Running Suite: ${suite.toUpperCase()} ===`);
+        const rawDeviceEnv = process.env.DEVICE || 'cpu';
+        const devices = rawDeviceEnv.split(',').map(d => d.trim()).filter(d => d.length > 0);
 
-            if (index > 0) {
-                 console.log('[Info] Relaunching browser for next suite...');
-                 try {
-                     // Close previous context/browser to release lock
-                     if (context) await context.close();
-                     // If browser is different object (non-persistent), close it too
-                     if (browser && browser !== context) await browser.close();
-                 } catch(e) {
-                     console.log(`Warning closing previous browser: ${e.message}`);
-                 }
+        for (const [deviceIndex, deviceItem] of devices.entries()) {
+            process.env.DEVICE = deviceItem;
+            console.log(`\n=== Running for Device: ${deviceItem.toUpperCase()} ===`);
 
-                 // Give it a moment to release file locks
-                 await new Promise(r => setTimeout(r, 2000));
+            for (const [suiteIndex, suite] of suites.entries()) {
+                console.log(`\n=== Running Suite: ${suite.toUpperCase()} (Device: ${deviceItem}) ===`);
 
-                 const instance = await launchBrowserInstance();
-                 browser = instance.browser || instance.context;
-                 context = instance.context;
-                 page = instance.page;
-            }
+                // Relaunch or Initial Launch
+                const isFirstRun = deviceIndex === 0 && suiteIndex === 0;
 
-            let currentRunner;
-            let suiteResults = [];
+                if (!isFirstRun) {
+                     console.log('[Info] Relaunching browser...');
+                     try {
+                         if (context) await context.close();
+                         if (browser && browser !== context) await browser.close();
+                     } catch(e) {
+                         console.log(`Warning closing previous browser: ${e.message}`);
+                     }
+                     // Give it a moment to release file locks
+                     await new Promise(r => setTimeout(r, 2000));
+                }
 
-            if (suite === 'wpt') {
-                currentRunner = new WptRunner(page);
-                currentRunner.launchNewBrowser = launcher;
-            } else if (suite === 'model') {
-                currentRunner = new ModelRunner(page);
-                currentRunner.launchNewBrowser = launcher;
-            } else {
-                console.error(`Unknown suite: ${suite}`);
-                continue;
-            }
+                if (!isFirstRun || !browser) {
+                     const instance = await launchBrowserInstance();
+                     browser = instance.browser || instance.context;
+                     context = instance.context;
+                     page = instance.page;
+                }
 
-            // Execute suite and (optionally) DLL check in parallel
-            let checkPromise = Promise.resolve(null);
-            if (index === 0) {
-                 const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
-                 // Delay checks slightly to let browser/tests warm up
-                 checkPromise = new Promise(resolve => setTimeout(resolve, 5000))
-                    .then(() => currentRunner.checkOnnxruntimeDlls(processName));
-            }
+                let currentRunner;
+                let suiteResults = [];
 
-            if (suite === 'wpt') {
-                 suiteResults = await currentRunner.runWptTests(context, browser);
-            } else if (suite === 'model') {
-                 suiteResults = await currentRunner.runModelTests();
-            }
+                if (suite === 'wpt') {
+                    currentRunner = new WptRunner(page);
+                    currentRunner.launchNewBrowser = launcher;
+                } else if (suite === 'model') {
+                    currentRunner = new ModelRunner(page);
+                    currentRunner.launchNewBrowser = launcher;
+                } else {
+                    console.error(`Unknown suite: ${suite}`);
+                    continue;
+                }
 
-            // Keep reference to a runner for reporting
-            runner = currentRunner;
-            results = results.concat(suiteResults);
+                // Execute suite and (optionally) DLL check in parallel
+                let checkPromise = Promise.resolve(null);
+                if (isFirstRun) {
+                     const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
+                     // Delay checks slightly to let browser/tests warm up
+                     checkPromise = new Promise(resolve => setTimeout(resolve, 5000))
+                        .then(() => currentRunner.checkOnnxruntimeDlls(processName));
+                }
 
-            // If we started a check, await it now (it runs in background during tests)
-            if (index === 0) {
-                 dllResults = await checkPromise;
+                if (suite === 'wpt') {
+                     suiteResults = await currentRunner.runWptTests(context, browser);
+                } else if (suite === 'model') {
+                     suiteResults = await currentRunner.runModelTests();
+                }
+
+                // Append device to test names to distinguish in report
+                suiteResults.forEach(r => {
+                    r.testName = `${r.testName} [${deviceItem}]`;
+                });
+
+                // Keep reference to a runner for reporting
+                runner = currentRunner;
+                results = results.concat(suiteResults);
+
+                // If we started a check, await it now (it runs in background during tests)
+                if (isFirstRun) {
+                     dllResults = await checkPromise;
+                }
             }
         }
 

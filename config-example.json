@@ -1,0 +1,11 @@
+{
+    [
+        "name": "ORT CPU WPT",
+        "args": [
+            "--enable-features=WebNNOnnxRuntime"
+        ],
+        "suite": "wpt",
+        "wpt-case": "add,abs",
+        "device": "cpu"
+    ]
+}
