@@ -50,7 +50,8 @@ export default defineConfig({
             '--disable-web-security',
             '--disable-features=VizDisplayCompositor',
             '--enable-unsafe-webgpu',
-            '--start-maximized'
+            '--start-maximized',
+            ...(process.env.EXTRA_BROWSER_ARGS ? process.env.EXTRA_BROWSER_ARGS.split(' ') : [])
           ]
         }
       },

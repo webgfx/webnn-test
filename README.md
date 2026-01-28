@@ -132,6 +132,18 @@ node src/main.js --suite wpt --chrome-channel beta
 
 **Supported channels:** stable (default), canary, dev, beta
 
+## Extra Browser Arguments
+
+Pass extra arguments to the browser launch sequence using `--extra-browser-args`:
+
+```bash
+# Pass GPU selection flags
+node src/main.js --suite wpt --extra-browser-args "--webnn-ort-ep-device=WebGpuExecutionProvider,0x8086,0x7d55"
+
+# Pass multiple arguments
+node src/main.js --suite wpt --extra-browser-args "--use-gl=angle --use-angle=gl"
+```
+
 ## Test Reports
 
 ### HTML Report Generation

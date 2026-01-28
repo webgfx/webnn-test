@@ -26,6 +26,7 @@ Options:
   --jobs <number>          Number of parallel jobs (default: 4)
   --repeat <number>        Number of times to repeat the test run (default: 1)
   --chrome-channel <name>  Chrome channel to use (default: canary). Values: stable, canary, dev, beta
+  --extra-browser-args <args> Extra arguments for browser launch (e.g. "--use-gl=angle --use-angle=gl")
   --email [address]        Send email report to address (default: ygu@microsoft.com if no address provided)
   --pause <case>           Pause execution on failure for specified case prefix
 
@@ -132,6 +133,13 @@ Examples:
     }
   }
 
+  // Find --extra-browser-args argument
+  const extraArgsIndex = args.findIndex(arg => arg === '--extra-browser-args');
+  let extraBrowserArgs = null;
+  if (extraArgsIndex !== -1 && extraArgsIndex + 1 < args.length) {
+    extraBrowserArgs = args[extraArgsIndex + 1];
+  }
+
   // Map 'stable' to 'chrome' for Playwright (Playwright uses 'chrome' not 'stable')
   const playwrightChannel = chromeChannel === 'stable' ? 'chrome' : `chrome-${chromeChannel}`;
 
@@ -175,6 +183,9 @@ Examples:
   if (epFlag) {
     console.log('--ep flag detected: Browser will be kept alive for DLL inspection');
   }
+  if (extraBrowserArgs) {
+    console.log(`[Browser] Extra launch arguments: ${extraBrowserArgs}`);
+  }
 
   // Set environment variables for the test
   process.env.TEST_SUITE = testSuite;
@@ -194,6 +205,9 @@ Examples:
   process.env.EP_FLAG = epFlag ? 'true' : 'false';
   process.env.JOBS = jobs.toString();
   process.env.CHROME_CHANNEL = playwrightChannel;
+  if (extraBrowserArgs) {
+    process.env.EXTRA_BROWSER_ARGS = extraBrowserArgs;
+  }
 
   // Pass --wpt-range and --pause as environment variables
   if (wptRange) {
@@ -296,6 +310,7 @@ Examples:
         '--pause', pauseCase,
         '--email', emailAddress,
         '--chrome-channel', chromeChannel,
+        '--extra-browser-args', extraBrowserArgs,
         '--ep',
         '--jobs', jobs.toString(),
         '--repeat', repeat.toString()
@@ -316,6 +331,7 @@ Examples:
               prevArg === '--wpt-range' ||
               prevArg === '--pause' ||
               prevArg === '--chrome-channel' ||
+              prevArg === '--extra-browser-args' ||
               prevArg === '--jobs' ||
               prevArg === '--repeat') {
             return false; // This is a value for a custom option, skip it
@@ -468,6 +484,10 @@ test.describe('WebNN Tests', () => {
         // Add flags consistent with original file
         if (process.env.EP_FLAG === 'true') {
              // Example flag, usually users supply platform specific ones
+        }
+
+        if (process.env.EXTRA_BROWSER_ARGS) {
+            args.push(...process.env.EXTRA_BROWSER_ARGS.split(' '));
         }
 
         const launchOptions = {
