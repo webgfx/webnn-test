@@ -278,7 +278,8 @@ class WptRunner extends WebNNRunner {
 
   async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0) {
     const testFileName = testFile.replace('.js', '.html');
-    const testUrl = `https://wpt.live/webnn/conformance_tests/${testFileName}?gpu`;
+    const device = process.env.DEVICE || 'cpu';
+    const testUrl = `https://wpt.live/webnn/conformance_tests/${testFileName}?device=${device}`;
     const testName = testFile.replace('.https.any.js', '').replace('.js', '');
 
     let logPrefix = `Running test`;

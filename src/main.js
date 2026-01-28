@@ -25,6 +25,7 @@ Options:
   --list                   List all test cases in the specified suite
   --jobs <number>          Number of parallel jobs (default: 4)
   --repeat <number>        Number of times to repeat the test run (default: 1)
+  --device <type>          Device type to use (default: cpu). Values: cpu, gpu, npu
   --chrome-channel <name>  Chrome channel to use (default: canary). Values: stable, canary, dev, beta
   --extra-browser-args <args> Extra arguments for browser launch (e.g. "--use-gl=angle --use-angle=gl")
   --email [address]        Send email report to address (default: ygu@microsoft.com if no address provided)
@@ -55,11 +56,27 @@ Examples:
   let epFlag = false;
   let jobs = 4; // default: run parallel with 4 jobs
   let repeat = 1; // default: run once
+  let device = 'cpu'; // default: cpu
 
   // Find --suite argument
   const suiteIndex = args.findIndex(arg => arg === '--suite');
   if (suiteIndex !== -1 && suiteIndex + 1 < args.length) {
     testSuite = args[suiteIndex + 1];
+  }
+
+  // Find --device argument
+  const deviceIndex = args.findIndex(arg => arg === '--device');
+  const deviceEqArg = args.find(arg => arg.startsWith('--device='));
+
+  if (deviceIndex !== -1 && deviceIndex + 1 < args.length) {
+    device = args[deviceIndex + 1].toLowerCase();
+  } else if (deviceEqArg) {
+    device = deviceEqArg.split('=')[1].toLowerCase();
+  }
+
+  if (!['cpu', 'gpu', 'npu'].includes(device)) {
+    console.error('Invalid --device value. Must be one of: cpu, gpu, npu');
+    process.exit(1);
   }
 
   // Find --jobs argument
@@ -187,8 +204,12 @@ Examples:
     console.log(`[Browser] Extra launch arguments: ${extraBrowserArgs}`);
   }
 
+  console.log(`[Device] Device type: ${device}`);
+
   // Set environment variables for the test
   process.env.TEST_SUITE = testSuite;
+  process.env.DEVICE = device;
+
 
   // Set suite-specific case environment variables
   if (wptCaseIndex !== -1 && wptCaseIndex + 1 < args.length) {
@@ -313,10 +334,14 @@ Examples:
         '--extra-browser-args', extraBrowserArgs,
         '--ep',
         '--jobs', jobs.toString(),
-        '--repeat', repeat.toString()
+        '--repeat', repeat.toString(),
+        '--device', device
       ];
 
       const filteredArgs = args.filter(arg => {
+        // Handle --device=value style
+        if (arg.startsWith('--device=')) return false;
+
         // Check if this arg is in our custom options list
         const argIndex = customOptions.indexOf(arg);
         if (argIndex !== -1) return false;
@@ -333,7 +358,8 @@ Examples:
               prevArg === '--chrome-channel' ||
               prevArg === '--extra-browser-args' ||
               prevArg === '--jobs' ||
-              prevArg === '--repeat') {
+              prevArg === '--repeat' ||
+              prevArg === '--device') {
             return false; // This is a value for a custom option, skip it
           }
           // Special case for --email: only skip next arg if it's not a flag
@@ -360,9 +386,10 @@ Examples:
         playwrightArgs.push(...filteredArgs);
       }
 
-      const playwrightProcess = spawn('npx', ['playwright', ...playwrightArgs], {
+      const playwrightCli = path.join(__dirname, '..', 'node_modules', '@playwright', 'test', 'cli.js');
+      const playwrightProcess = spawn(process.execPath, [playwrightCli, ...playwrightArgs], {
         stdio: 'inherit',
-        shell: true,
+        shell: false,
         env: { ...process.env },
       });
 
@@ -515,26 +542,43 @@ test.describe('WebNN Tests', () => {
 
         console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
 
+        let context, page, browser;
+
         // Use launchPersistentContext to reuse user data dir
         try {
-            const context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+            context = await chromium.launchPersistentContext(userDataDir, launchOptions);
             // Always create a new page for the test to avoid interference with restored tabs
             // and ensure we have a fresh, focused tab.
-            const page = await context.newPage();
+            page = await context.newPage();
 
             // Bring to front just in case
             await page.bringToFront();
 
-            return { context, page };
         } catch (e) {
             console.error(`[Error] Failed to launch persistent context: ${e.message}`);
             // Fallback to standard launch if persistent fails (e.g. locked files)
             console.log('[Warning]  Falling back to standard launch (fresh profile)...');
-            const browser = await chromium.launch(launchOptions);
-            const context = await browser.newContext();
-            const page = await context.newPage();
-            return { context, page, browser };
+            browser = await chromium.launch(launchOptions);
+            context = await browser.newContext();
+            page = await context.newPage();
         }
+
+        if (process.env.DEVICE) {
+            const deviceType = process.env.DEVICE;
+            await context.addInitScript((type) => {
+                if (navigator.ml && !navigator.ml.createContext._instrumented) {
+                    const originalCreateContext = navigator.ml.createContext;
+                    navigator.ml.createContext = async function(options) {
+                        options = options || {};
+                        options.deviceType = type;
+                        return originalCreateContext.call(navigator.ml, options);
+                    };
+                    navigator.ml.createContext._instrumented = true;
+                }
+            }, deviceType);
+        }
+
+        return { context, page, browser };
     };
 
     test.beforeAll(async () => {
@@ -656,3 +700,4 @@ test.describe('WebNN Tests', () => {
     });
 });
 }
+
