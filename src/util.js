@@ -555,9 +555,9 @@ class WebNNRunner {
             // 2. Get Modules from that process
             // Usage of depth 2 is often enough for FileVersionInfo
             const cmdModules = `Get-Process -Id ${pid} | Select-Object -ExpandProperty Modules | Select-Object ModuleName, FileName, @{N='ProductVersion';E={$_.FileVersionInfo.ProductVersion}} | ConvertTo-Json -Compress`;
-            
+
             const modulesJson = execSync(cmdModules, { encoding: 'utf8', maxBuffer: 1024 * 1024 * 5, shell: 'powershell.exe' }).trim();
-            
+
             if (!modulesJson) throw new Error('Failed to retrieve modules from GPU process');
 
             let modules = [];
@@ -576,7 +576,7 @@ class WebNNRunner {
                  const dllsOutput = findings.map(m => {
                      return `${m.FileName} (Version: ${m.ProductVersion || 'Unknown'})`;
                  }).join('\n');
-                 
+
                  console.log(`[Success] ONNX Runtime/Backend DLLs found:\n${dllsOutput}`);
                  return { found: true, dlls: dllsOutput, dllCount: findings.length };
             } else {
@@ -585,7 +585,7 @@ class WebNNRunner {
 
         } catch (e) {
             console.log(`[Warning] DLL Check Attempt ${attempt + 1} failed: ${e.message}`);
-            
+
             if (attempt < MAX_RETRIES) {
                 attempt++;
                 await new Promise(r => setTimeout(r, 2000));
