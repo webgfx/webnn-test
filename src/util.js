@@ -283,6 +283,7 @@ async function launchBrowser() {
        '--enable-features=WebMachineLearningNeuralNetwork',
        '--webnn-ort-ignore-ep-blocklist',
        '--ignore-gpu-blocklist',
+       '--disable_webnn_for_npu=0',
        //'--webnn-ort-logging-level=VERBOSE',
    ];
 
