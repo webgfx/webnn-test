@@ -342,8 +342,8 @@ class WptRunner extends WebNNRunner {
 
         // Parse results with robust logic from original file
         // Also scrape detailed failure info if verbose mode is enabled
-        const verboseEnabled = process.env.VERBOSE === 'true';
-        
+        const verboseEnabled = true;
+
         const resData = await page.evaluate((scrapeDetails) => {
             const body = document.body.textContent;
             let subcases = { total: 0, passed: 0, failed: 0 };
@@ -418,28 +418,28 @@ class WptRunner extends WebNNRunner {
                 // WPT results structure: #results IS the table element (contains thead/tbody directly)
                 // Don't use '#results table' as that matches nested empty tables in <details>
                 const resultsTable = document.querySelector('#results');
-                
+
                 if (resultsTable) {
                     // Query direct child rows from tbody using :scope
                     const tbody = resultsTable.querySelector('tbody');
                     const allRows = tbody ? tbody.querySelectorAll(':scope > tr') : resultsTable.querySelectorAll(':scope > tr');
-                    
+
                     allRows.forEach(row => {
                         // Skip header rows
                         if (row.querySelector('th')) return;
-                        
+
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 2) {
                             const statusCell = cells[0];
                             const nameCell = cells[1];
                             const messageCell = cells[2];
-                            
+
                             const status = statusCell ? statusCell.textContent.trim().toUpperCase() : '';
-                            
+
                             if (status === 'FAIL' || status === 'TIMEOUT' || status === 'ERROR' || status === 'NOTRUN') {
                                 // Test name is in the second column
                                 const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
-                                
+
                                 // Message is in the third column
                                 let message = '';
                                 if (messageCell) {
@@ -448,7 +448,7 @@ class WptRunner extends WebNNRunner {
                                     if (details) details.remove();
                                     message = clone.textContent.trim().substring(0, 800);
                                 }
-                                
+
                                 failedSubtests.push({
                                     name: testName || 'Unknown subtest',
                                     status: status,
@@ -468,37 +468,37 @@ class WptRunner extends WebNNRunner {
         if (verboseEnabled && resData.subcases.failed > 0 && failedSubtests.length === 0) {
             // Wait a bit more for the table to populate
             await page.waitForTimeout(1000);
-            
+
             try {
                 failedSubtests = await page.evaluate(() => {
                     const failures = [];
-                    
+
                     // #results IS the table element (contains thead/tbody directly)
                     // Don't look for a nested table - that matches the empty table in <details>
                     const resultsTable = document.querySelector('#results');
-                    
+
                     if (resultsTable) {
                         // Query rows from tbody using :scope to get direct children only
                         const tbody = resultsTable.querySelector('tbody');
                         const allRows = tbody ? tbody.querySelectorAll(':scope > tr') : resultsTable.querySelectorAll(':scope > tr');
-                        
+
                         allRows.forEach((row) => {
                             // Skip header rows
                             if (row.querySelector('th')) return;
-                            
+
                             const cells = row.querySelectorAll('td');
-                            
+
                             if (cells.length >= 2) {
                                 const statusCell = cells[0];
                                 const nameCell = cells[1];
                                 const messageCell = cells[2];
-                                
+
                                 const status = statusCell ? statusCell.textContent.trim().toUpperCase() : '';
-                                
+
                                 if (status === 'FAIL' || status === 'TIMEOUT' || status === 'ERROR' || status === 'NOTRUN') {
                                     // Test name is in the second column
                                     const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
-                                    
+
                                     // Message is in the third column, often starts with assertion text
                                     let message = '';
                                     if (messageCell) {
@@ -508,7 +508,7 @@ class WptRunner extends WebNNRunner {
                                         if (details) details.remove();
                                         message = clone.textContent.trim().substring(0, 800);
                                     }
-                                    
+
                                     failures.push({
                                         name: testName,
                                         status: status,

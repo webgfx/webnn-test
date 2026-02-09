@@ -8,10 +8,44 @@ const { test, expect, chromium } = require('@playwright/test');
 
 const { WptRunner } = require('./wpt');
 const { ModelRunner } = require('./model');
-const { launchBrowser } = require('./util');
+const { launchBrowser, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
 
 // Helper to parse comma-separated lists
 const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
+
+// Helper to identify framework and backend
+const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNOnnxRuntime') ? 'ort' : 'litert';
+const getBackend = (framework, browserArgs, dllResults, device) => {
+    // If device is cpu, backend has to be cpu
+    if (device === 'cpu') return 'cpu';
+
+    // If DLL check explicitly failed or found nothing, and we are expecting acceleration, fallback to cpu
+    if (dllResults && dllResults.found === false && framework === 'ort') {
+        return 'cpu';
+    }
+
+    // Checking DLL naming for backend detection
+    if (framework === 'ort' && dllResults && dllResults.modules && dllResults.modules.length > 0) {
+         const modules = dllResults.modules.map(m => (m.ModuleName || m).toLowerCase());
+         const rawModules = JSON.stringify(modules);
+
+         if (rawModules.includes('openvino')) return 'openvino';
+         if (rawModules.includes('tensorrt')) return 'tensorrt';
+         if (rawModules.includes('migraphx')) return 'migraphx';
+         if (rawModules.includes('qnn')) return 'qnn';
+         if (rawModules.includes('directml')) return 'dml';
+    }
+
+    const args = browserArgs || '';
+    if (framework === 'litert') return 'cpu'; // Default for litert
+    if (args.includes('WebGpuExecutionProvider')) return 'webgpu';
+    if (args.includes('OpenVINO')) return 'openvino';
+    if (args.includes('Qnn')) return 'qnn';
+    if (args.includes('Dml')) return 'dml';
+    if (args.includes('MigraphX')) return 'migraphx';
+    if (args.includes('Tensorrt')) return 'tensorrt';
+    return 'cpu'; // Default fallback
+};
 
 if (require.main === module && process.env.IS_PLAYWRIGHT_CHILD_PROCESS !== 'true') {
   // ===========================================================================
@@ -40,7 +74,7 @@ Options:
   --pause <case>           Pause execution on failure
   --browser-path <path>    Custom path to browser executable
   --skip-retry             Skip the retry stage for failed tests
-  --verbose                Capture detailed per-subtest failure information
+  --baseline <folder>      Baseline folder (timestamp) for comparison
 
 Test Selection:
   --wpt-case <filter>      Run specific WPT test cases
@@ -101,10 +135,10 @@ Examples:
   const globalExtraArgs = getArg('--browser-arg');
   const browserPath = getArg('--browser-path');
   const skipRetry = args.includes('--skip-retry');
+  const baseline = getArg('--baseline');
   const configFile = getArg('--config');
   const pauseCase = getArg('--pause');
   const wptRange = getArg('--wpt-range');
-  const verbose = args.includes('--verbose');
 
   // --- Config Generation ---
   let runConfigs = [];
@@ -180,7 +214,7 @@ Examples:
   }
   if (browserPath) process.env.BROWSER_PATH = browserPath;
   if (skipRetry) process.env.SKIP_RETRY = 'true';
-  if (verbose) process.env.VERBOSE = 'true';
+  if (baseline) process.env.BASELINE_DIR = baseline;
 
   delete process.env.TEST_SUITE;
   delete process.env.DEVICE;
@@ -203,13 +237,33 @@ Examples:
           process.env.TEST_ITERATION = iteration.toString();
           process.env.TEST_TOTAL_ITERATIONS = totalIterations.toString();
 
+          // Generate timestamp for this iteration
+          const now = new Date();
+          const timestamp = now.getFullYear().toString() +
+            (now.getMonth() + 1).toString().padStart(2, '0') +
+            now.getDate().toString().padStart(2, '0') +
+            now.getHours().toString().padStart(2, '0') +
+            now.getMinutes().toString().padStart(2, '0') +
+            now.getSeconds().toString().padStart(2, '0');
+
+          const reportDir = path.join(__dirname, '..', 'results');
+          const runDir = path.join(reportDir, timestamp);
+
+          if (!fs.existsSync(runDir)) fs.mkdirSync(runDir, {recursive: true});
+
           const playwrightArgs = [
             'test',
             '-c', path.join(__dirname, '..', 'runner.config.js'),
             'src/main.js',
             '--reporter=line,html',
+            `--output=${path.join('results', timestamp, 'artifacts')}`,
             '--timeout=0'
           ];
+
+          process.env.PLAYWRIGHT_HTML_REPORT = path.join(runDir, 'playwright');
+          process.env.PROJECT_TIMESTAMP = timestamp; // Pass timestamp to child process if needed
+          process.env.PROJECT_RUN_DIR = runDir;      // Pass full run dir to child process
+
           if (process.env.CI) playwrightArgs.push('--retries=2');
 
           const playwrightCli = path.join(__dirname, '..', 'node_modules', '@playwright', 'test', 'cli.js');
@@ -221,41 +275,8 @@ Examples:
           });
 
           childProcess.on('close', (code) => {
-              // Report Copy Logic
               if (code === 0) {
-                  const reportTempDir = path.join(__dirname, '..', 'report-temp');
-                  const reportDir = path.join(__dirname, '..', 'report');
-                  try {
-                      if (fs.existsSync(reportTempDir)) {
-                          if (!fs.existsSync(reportDir)) fs.mkdirSync(reportDir, {recursive: true});
-
-                           const copyDir = (src, dest) => {
-                                if (!fs.existsSync(dest)) fs.mkdirSync(dest, {recursive: true});
-                                fs.readdirSync(src, {withFileTypes: true}).forEach(ent => {
-                                    const s = path.join(src, ent.name), d = path.join(dest, ent.name);
-                                    if (ent.isDirectory()) copyDir(s, d);
-                                    else fs.copyFileSync(s, d);
-                                });
-                           };
-                           copyDir(reportTempDir, reportDir);
-
-                           const now = new Date();
-                           const timestamp = now.getFullYear().toString() +
-                             (now.getMonth() + 1).toString().padStart(2, '0') +
-                             now.getDate().toString().padStart(2, '0') +
-                             now.getHours().toString().padStart(2, '0') +
-                             now.getMinutes().toString().padStart(2, '0') +
-                             now.getSeconds().toString().padStart(2, '0');
-                           const suffix = totalIterations > 1 ? `_iter${iteration}` : '';
-                           const newName = path.join(reportDir, `${timestamp}${suffix}.html`);
-                           if (fs.existsSync(path.join(reportDir, 'index.html'))) {
-                               fs.renameSync(path.join(reportDir, 'index.html'), newName);
-                               console.log(`[Report] Generated: ${newName}`);
-                           }
-                      }
-                  } catch (e) {
-                      console.error('Error handling report:', e);
-                  }
+                  console.log(`[Success] Results saved to: ${runDir}`);
                   resolve(0);
               } else {
                   console.log(`\n[Fail] ${iterationPrefix}Test iteration failed with code ${code}`);
@@ -336,10 +357,22 @@ Examples:
               let results = [];
               let runner = null;
               const startTime = Date.now();
-              let dllResults = null;
+              // Store DLL results per configuration
+              // Structure: { configName: string, framework: string, backend: string, device: string, results: object }
+              let allDllResults = [];
 
               for (const [idx, config] of configs.entries()) {
+                   // Pre-flight check: Skip if NPU/GPU device requested but not found
+                   if (config.device === 'npu') {
+                       const npuInfo = get_npu_info();
+                       if (npuInfo === 'Unknown NPU') {
+                           console.log(`\n[Skip] Skipping config ${config.name} (Platform: NPU) - No NPU detected.`);
+                           continue;
+                       }
+                   }
+
                    console.log(`\n=== Running Config: ${config.name} (Suite: ${config.suite}, Device: ${config.device}) ===`);
+                   let currentDllResults = null;
 
                    process.env.EXTRA_BROWSER_ARGS = config.browserArgs || '';
                    process.env.DEVICE = config.device;
@@ -367,7 +400,7 @@ Examples:
                    runner = currentRunner;
 
                    if (idx === 0) {
-                        const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
+                        // const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
                         // Short delay to ensure process is stable
                         // await new Promise(r => setTimeout(r, 2000));
                         // dllResults = await currentRunner.checkOnnxruntimeDlls(processName);
@@ -380,10 +413,10 @@ Examples:
 
                    // Callback to run DLL check after first case execution
                    const onFirstCaseComplete = async () => {
-                       if (idx === 0 && !dllResults) {
+                       if (!currentDllResults) {
                            const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
                            console.log('[Info] First case completed. Checking DLLs...');
-                           dllResults = await currentRunner.checkOnnxruntimeDlls(processName);
+                           currentDllResults = await currentRunner.checkOnnxruntimeDlls(processName);
                        }
                    };
 
@@ -395,13 +428,29 @@ Examples:
                    }
 
                    // Ensure check ran if for some reason callback wasn't triggered (e.g. 0 tests)
-                   if (idx === 0 && !dllResults) await onFirstCaseComplete();
+                   if (!currentDllResults) await onFirstCaseComplete();
 
+                   const fw = getFramework(config.browserArgs);
+                   const bk = getBackend(fw, config.browserArgs, currentDllResults, config.device);
+
+                   // Store DLL info for this configuration
+                   allDllResults.push({
+                      configName: config.name,
+                      framework: fw,
+                      backend: bk,
+                      device: config.device,
+                      dllInfo: currentDllResults
+                   });
 
                    runRes.forEach(r => {
                        r.configName = config.name;
                        r.device = config.device;
                        r.fullConfig = config;
+                       // Determine identifiers for report matching
+                       r.framework = fw;
+                       // We use the dllResults (global for now, but usually reflects the first/main run)
+                       // If multiple configs are run, this might need refinement to be per-config
+                       r.backend = bk;
                    });
                    results = results.concat(runRes);
               }
@@ -412,11 +461,212 @@ Examples:
                    const subtitle = configs.map(c => c.name).join(', ');
                    const suiteNames = [...new Set(configs.map(c => c.suite))];
 
-                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, dllResults, wallTime, sumOfTestTimes);
+                   // --- Resolve System Device Names ---
+                   // Do this BEFORE report generation so both HTML and Text reports use the same resolved names
+                   let sysGpuInfo = null;
+                   let sysCpuInfo = null;
+                   let sysNpuInfo = null;
+                   try { sysGpuInfo = get_gpu_info(); } catch(e) {}
+                   try { sysCpuInfo = get_cpu_info(); } catch(e) {}
+                   try { sysNpuInfo = get_npu_info(); } catch(e) {}
 
-                   const reportDir = path.join(__dirname, '..', 'report-temp');
-                   if (!fs.existsSync(reportDir)) fs.mkdirSync(reportDir, {recursive:true});
-                   fs.writeFileSync(path.join(reportDir, 'index.html'), report);
+                   results.forEach(r => {
+                       let deviceName = r.device;
+
+                       if (deviceName === 'gpu') {
+                           if (sysGpuInfo && sysGpuInfo.device_id) deviceName = sysGpuInfo.device_id;
+                       } else if (deviceName === 'cpu') {
+                           if (sysCpuInfo) {
+                               const rawName = sysCpuInfo.toLowerCase();
+                               if (rawName.includes('intel')) deviceName = 'intel';
+                               else if (rawName.includes('amd')) deviceName = 'amd';
+                               else if (rawName.includes('qualcomm') || rawName.includes('snapdragon')) deviceName = 'qualcomm';
+                               else if (rawName.includes('arm')) deviceName = 'arm';
+                               else {
+                                   deviceName = rawName.replace(/[^a-zA-Z0-9]/g, '');
+                                   if (deviceName.length > 20) deviceName = deviceName.substring(0, 20);
+                               }
+                           }
+                       } else if (deviceName === 'npu') {
+                           if (sysNpuInfo && sysNpuInfo.device_id) {
+                               deviceName = sysNpuInfo.device_id;
+                           } else if (sysNpuInfo && sysNpuInfo.name) {
+                               deviceName = sysNpuInfo.name.replace(/[^a-zA-Z0-9]/g, '');
+                           }
+                       }
+                       r.deviceName = deviceName.toLowerCase();
+                       // Update dllResults with resolved device name
+                       const relatedDllResult = allDllResults.find(d => d.configName === r.configName);
+                       if (relatedDllResult) {
+                           relatedDllResult.device = r.deviceName;
+                       }
+                   });
+
+                   const resultsRoot = path.join(__dirname, '..', 'results');
+                   let baselineDirName = process.env.BASELINE_DIR || null;
+
+                   // -----------------------------------
+                   // Baseline Comparison Logic (Moved here to use resolved identifiers)
+                   // -----------------------------------
+                   try {
+                       // Find latest baseline if not specified
+                       if (!baselineDirName && fs.existsSync(resultsRoot)) {
+                           let dirs = [];
+                           const currentTimestamp = process.env.PROJECT_TIMESTAMP;
+                             dirs = fs.readdirSync(resultsRoot)
+                                .filter(f => {
+                                    // Exclude current run directory
+                                    if (currentTimestamp && f.includes(currentTimestamp)) return false;
+                                    const fullPath = path.join(resultsRoot, f);
+                                    if (!fs.statSync(fullPath).isDirectory()) return false;
+                                    // Skip non-result directories
+                                    if (['temp', 'playwright', 'artifacts'].includes(f)) return false;
+                                    // Accept bl- prefixed baseline dirs or pure timestamp dirs
+                                    if (f.startsWith('bl-')) return true;
+                                    if (/^\d+$/.test(f)) return true;
+                                    return false;
+                                })
+                                .sort((a, b) => {
+                                    // Sort by timestamp portion (strip bl- prefix if present)
+                                    const tsA = a.replace(/^bl-/, '');
+                                    const tsB = b.replace(/^bl-/, '');
+                                    return tsB.localeCompare(tsA); // Newest first
+                                });
+
+                           // Prefer bl- prefixed (explicit baseline) over regular runs
+                           const blDir = dirs.find(d => d.startsWith('bl-'));
+                           if (blDir) {
+                               baselineDirName = blDir;
+                           } else if (dirs.length > 0) {
+                               baselineDirName = dirs[0];
+                           }
+                       }
+
+                       if (baselineDirName) {
+                           const latestDir = path.join(resultsRoot, baselineDirName);
+                           // Find the main text report file. Usually has the same name as folder or ends in .txt
+                           // The text report writer uses: `${timestamp}.txt` or `index.txt`
+                           // We will look for *.txt that are NOT 'artifacts' or 'debug'
+                           const files = fs.readdirSync(latestDir).filter(f => f.endsWith('.txt'));
+                           // If specific timestamp file exists (matching dir name or its timestamp part), prefer it
+                           const baselineTimestamp = baselineDirName.replace(/^bl-/, '');
+                           let baselineFile = files.find(f => f.includes(baselineDirName)) ||
+                                              files.find(f => f.includes(baselineTimestamp));
+                           if (!baselineFile && files.length > 0) baselineFile = files[0];
+
+                           if (baselineFile) {
+                               const content = fs.readFileSync(path.join(latestDir, baselineFile), 'utf8');
+                               // Parse content:
+                               // [ort-gpu-nvidia]
+                               // test1: PASS
+                               const baselineData = {}; // key -> Map<testName, status>
+                               let currentKey = null;
+
+                               const lines = content.split('\n');
+                               for (const line of lines) {
+                                   const trimmed = line.trim();
+                                   if (!trimmed) continue;
+                                   if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+                                       currentKey = trimmed.slice(1, -1);
+                                       baselineData[currentKey] = {};
+                                   } else if (currentKey && trimmed.includes(':')) {
+                                       // Robust parsing for "TestName: Status" where TestName might contain colons.
+                                       // We assume the Status does not contain colons and is at the end.
+                                       // Text report format: `${r.testName}: ${r.result}`
+                                       // Skip subteset detail lines (indented with "  - ")
+                                       if (trimmed.startsWith('- ')) continue;
+                                       const lastColonIndex = trimmed.lastIndexOf(':');
+                                       if (lastColonIndex !== -1) {
+                                           const name = trimmed.substring(0, lastColonIndex).trim();
+                                           const statusPart = trimmed.substring(lastColonIndex + 1).trim();
+                                           // Status might be "PASS", "FAIL", "TIMEOUT"
+                                           baselineData[currentKey][name] = statusPart.split(' ')[0];
+                                       }
+                                   }
+                               }
+
+                               // Compare
+                               let matchCount = 0;
+                               results.forEach(r => {
+                                   // Construct key matching how text report generates it
+                                   // key = `${r.framework}-${r.backend}-${r.deviceName}`
+                                   const key = `${r.framework}-${r.backend}-${r.deviceName}`;
+                                   if (baselineData[key] && baselineData[key][r.testName]) {
+                                       r.previousResult = baselineData[key][r.testName];
+                                       matchCount++;
+                                   }
+                               });
+                               console.log(`[Baseline] Loaded from ${baselineDirName} (${baselineFile}). Matched ${matchCount} tests.`);
+                           }
+                       }
+                   } catch (e) {
+                       console.error('[Baseline] Error processing:', e.message);
+                   }
+                   // -----------------------------------
+
+                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, allDllResults, wallTime, sumOfTestTimes, baselineDirName);
+
+                   const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');
+                   const timestamp = process.env.PROJECT_TIMESTAMP;
+                   const reportFileName = timestamp ? `${timestamp}.html` : 'index.html';
+
+                   // Write HTML report to the specific run directory
+                   fs.writeFileSync(path.join(runDir, reportFileName), report);
+                   console.log(`[Report] Generated: ${path.join(runDir, reportFileName)}`);
+
+                   // --- Generate Plain Text Results ---
+                   try {
+                       // Group results by unique framework-backend-device combination
+                       const groups = {};
+                       // Retrieve system HW Info once (already done above)
+
+                       // Header with System Info
+                       let sysInfoText = '=== System Information ===\n';
+                       if (sysCpuInfo) sysInfoText += `CPU: ${sysCpuInfo}\n`;
+                       if (sysGpuInfo) {
+                           sysInfoText += `GPU: ${sysGpuInfo.name || 'Unknown'}\n`;
+                           if (sysGpuInfo.driver_ver) sysInfoText += `GPU Driver: ${sysGpuInfo.driver_ver}\n`;
+                       }
+                       if (sysNpuInfo) {
+                           let npuName = typeof sysNpuInfo === 'string' ? sysNpuInfo : sysNpuInfo.name;
+                           if (npuName === 'Unknown NPU') npuName = 'None';
+                           sysInfoText += `NPU: ${npuName}\n`;
+                       }
+                       sysInfoText += '==========================\n';
+
+                       results.forEach(r => {
+                           const key = `${r.framework}-${r.backend}-${r.deviceName}`;
+                           if (!groups[key]) groups[key] = [];
+                           groups[key].push(r);
+                       });
+
+                       let allTextContent = sysInfoText;
+                       for (const [key, groupResults] of Object.entries(groups)) {
+                           allTextContent += `\n[${key}]\n`;
+
+                           const content = groupResults.map(r => {
+                               let line = `${r.testName}: ${r.result}`;
+                               // Append detailed failure messages for WPT if available
+                               if (r.failedSubtests && r.failedSubtests.length > 0) {
+                                   const subtestDetails = r.failedSubtests.map(s => `  - ${s.name}: ${s.status}`).join('\n');
+                                   line += `\n${subtestDetails}`;
+                               }
+                               return line;
+                           }).join('\n');
+
+                           allTextContent += content + '\n';
+                       }
+
+                       // Determine output output dir
+                       const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');
+                       const timestamp = process.env.PROJECT_TIMESTAMP;
+
+                       // If timestamp is available, prefix it, otherwise just use key
+                       const fileName = timestamp ? `${timestamp}.txt` : `index.txt`;
+
+                       fs.writeFileSync(path.join(runDir, fileName), allTextContent.trim());
+                   } catch (e) { console.error('Error saving text report:', e); }
+                   // -----------------------------------
 
                    if (process.env.EMAIL_TO) {
                        await runner.sendEmailReport(process.env.EMAIL_TO, suiteNames, results, wallTime, sumOfTestTimes, null, report);

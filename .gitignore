@@ -5,11 +5,8 @@ yarn-debug.log*
 yarn-error.log*
 
 # Playwright
-test-results/
-report/
-report-temp/
+results/
 playwright/.cache/
-playwright-report/
 
 # Checkpoint files (resume functionality)
 .checkpoint/

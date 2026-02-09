@@ -188,7 +188,7 @@ After test execution completes, an HTML report is automatically generated with:
 
 ### Report Files
 
-Reports are saved in the `report/` directory:
+Reports are saved in the `results/` directory:
 
 - **Timestamped Reports**: Each test run generates a timestamped file (format: `YYYYMMDDHHMMSS.html`)
 - **Iteration Reports**: When using `--repeat`, each iteration gets a suffix `_iter1`, `_iter2`, etc.
@@ -200,11 +200,11 @@ Reports are automatically opened in your default browser after test completion. 
 
 ```bash
 # Open the report directory
-start report/
+start results/
 
 # Open a specific report
-start report/20251022143025.html
+start results/20251022143025.html
 
 # Open an iteration report
-start report/20251022143025_iter1.html
+start results/20251022143025_iter1.html
 ```

@@ -9,8 +9,8 @@
     "test:wpt": "playwright test --project=chromium-canary -- --suite=wpt",
     "test:sample": "playwright test --project=chromium-canary -- --suite=sample",
     "test:preview": "playwright test --project=chromium-canary -- --suite=preview",
-    "report": "start report/index.html",
-    "report-static": "start report/index.html"
+    "report": "start results/index.html",
+    "report-static": "start results/index.html"
   },
   "devDependencies": {
     "@playwright/test": "^1.40.0"

@@ -3,14 +3,7 @@
         "name": "ORT wpt",
         "browser-arg": "--enable-features=WebNNOnnxRuntime",
         "suite": "wpt",
-        "wpt-case": "add",
-        "device": "cpu,gpu,npu"
-    },
-    {
-        "name": "ORT model",
-        "browser-arg": "--enable-features=WebNNOnnxRuntime",
-        "suite": "model",
-        "model-case": "lenet",
+        "wpt-case": "add,abs",
         "device": "cpu,gpu,npu"
     }
 ]
