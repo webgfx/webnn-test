@@ -720,7 +720,7 @@ class WebNNRunner {
     const failed = results.filter(r => r.result === 'FAIL').length;
     const errors = results.filter(r => r.result === 'ERROR').length;
 
-    // Calculate overall regressions and improvements
+    // Calculate overall regressions and improvements (case-level and subcase-level)
     const allRegressions = [];
     const allImprovements = [];
     results.forEach(r => {
@@ -729,8 +729,46 @@ class WebNNRunner {
             const isPass = r.result === 'PASS';
             const wasPass = prev === 'PASS';
             const groupKey = `${r.framework}-${r.backend}-${r.deviceName || r.device || 'unknown'}`;
-            if (wasPass && !isPass) allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey });
-            else if (!wasPass && isPass) allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey });
+            if (wasPass && !isPass) {
+                // Case-level regression
+                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+            } else if (!wasPass && isPass) {
+                // Case-level improvement
+                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+            } else if (r.previousSubcases && r.subcases && r.subcases.total > 0) {
+                // Same case-level result — check subcase-level changes
+                const prevSc = r.previousSubcases;
+                const curSc = r.subcases;
+                if (prevSc.passed !== undefined && prevSc.total !== undefined) {
+                    // New format: compare passed/total
+                    if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
+                        allRegressions.push({
+                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
+                        });
+                    } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
+                        allImprovements.push({
+                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
+                        });
+                    }
+                } else if (prevSc.failed !== undefined) {
+                    // Old format: only failed count available from subtest detail lines
+                    const curFailed = curSc.failed || 0;
+                    const prevFailed = prevSc.failed || 0;
+                    if (curFailed > prevFailed) {
+                        allRegressions.push({
+                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
+                        });
+                    } else if (curFailed < prevFailed) {
+                        allImprovements.push({
+                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
+                        });
+                    }
+                }
+            }
         }
     });
     const totalRegressions = allRegressions.length;
@@ -945,10 +983,10 @@ class WebNNRunner {
                     <tbody>
                         ${allRegressions.map(t => `
                         <tr>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong></td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
                             <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -969,10 +1007,10 @@ class WebNNRunner {
                     <tbody>
                         ${allImprovements.map(t => `
                         <tr>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong></td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
                             <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -999,8 +1037,12 @@ class WebNNRunner {
             resultsByConfig[key].push(r);
         });
 
-        // Sort keys to have consistent order, e.g. group by config name
-        const sortedKeys = Object.keys(resultsByConfig).sort();
+        // Preserve execution order: sort by the first configIndex seen in each group
+        const sortedKeys = Object.keys(resultsByConfig).sort((a, b) => {
+            const idxA = resultsByConfig[a][0].configIndex ?? 0;
+            const idxB = resultsByConfig[b][0].configIndex ?? 0;
+            return idxA - idxB;
+        });
 
         return sortedKeys.map(key => {
             const groupResults = resultsByConfig[key];
@@ -1080,7 +1122,7 @@ class WebNNRunner {
             const groupFailedSubcases = groupResults.reduce((s,r)=>s+r.subcases.failed,0);
             const successRate = groupTotalSubcases > 0 ? ((groupPassedSubcases / groupTotalSubcases) * 100).toFixed(1) : '0.0';
 
-            // Calculate Trends
+            // Calculate Trends (case-level and subcase-level)
             const regressionTests = [];
             const improvementTests = [];
             groupResults.forEach(r => {
@@ -1088,8 +1130,29 @@ class WebNNRunner {
                 if (prev) {
                     const isPass = r.result === 'PASS';
                     const wasPass = prev === 'PASS';
-                    if (wasPass && !isPass) regressionTests.push({ name: r.testName, result: r.result, prev: prev });
-                    else if (!wasPass && isPass) improvementTests.push({ name: r.testName, result: r.result, prev: prev });
+                    if (wasPass && !isPass) {
+                        regressionTests.push({ name: r.testName, result: r.result, prev, type: 'case' });
+                    } else if (!wasPass && isPass) {
+                        improvementTests.push({ name: r.testName, result: r.result, prev, type: 'case' });
+                    } else if (r.previousSubcases && r.subcases && r.subcases.total > 0) {
+                        const prevSc = r.previousSubcases;
+                        const curSc = r.subcases;
+                        if (prevSc.passed !== undefined && prevSc.total !== undefined) {
+                            if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
+                                regressionTests.push({ name: r.testName, result: r.result, prev, type: 'subcase', subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}` });
+                            } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
+                                improvementTests.push({ name: r.testName, result: r.result, prev, type: 'subcase', subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}` });
+                            }
+                        } else if (prevSc.failed !== undefined) {
+                            const curFailed = curSc.failed || 0;
+                            const prevFailed = prevSc.failed || 0;
+                            if (curFailed > prevFailed) {
+                                regressionTests.push({ name: r.testName, result: r.result, prev, type: 'subcase', subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed` });
+                            } else if (curFailed < prevFailed) {
+                                improvementTests.push({ name: r.testName, result: r.result, prev, type: 'subcase', subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed` });
+                            }
+                        }
+                    }
                 }
             });
             const groupRegressions = regressionTests.length;
@@ -1122,7 +1185,7 @@ class WebNNRunner {
                     <div style="margin-bottom: 10px; padding: 10px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 6px;">
                         <strong style="color: #dc3545;">▼ Regressions (${groupRegressions}):</strong>
                         <ul style="margin: 5px 0 0 0; padding-left: 20px; font-size: 13px; color: #24292e; max-height: 150px; overflow-y: auto;">
-                            ${regressionTests.map(t => `<li><strong>${t.name}</strong> <span style="color: #666; font-size: 0.9em;">(${t.prev} &#8594; ${t.result})</span></li>`).join('')}
+                            ${regressionTests.map(t => `<li><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${t.prev} &#8594; ${t.result})`}</span></li>`).join('')}
                         </ul>
                     </div>`;
                 }
@@ -1131,7 +1194,7 @@ class WebNNRunner {
                     <div style="margin-bottom: 10px; padding: 10px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 6px;">
                         <strong style="color: #28a745;">▲ Improvements (${groupImprovements}):</strong>
                         <ul style="margin: 5px 0 0 0; padding-left: 20px; font-size: 13px; color: #24292e; max-height: 150px; overflow-y: auto;">
-                            ${improvementTests.map(t => `<li><strong>${t.name}</strong> <span style="color: #666; font-size: 0.9em;">(${t.prev} &#8594; ${t.result})</span></li>`).join('')}
+                            ${improvementTests.map(t => `<li><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${t.prev} &#8594; ${t.result})`}</span></li>`).join('')}
                         </ul>
                     </div>`;
                 }
@@ -1191,8 +1254,39 @@ class WebNNRunner {
                                   trendHtml = '<span style="color: #dc3545; font-weight: bold;">▼ REGRESSION</span>';
                               } else if (!wasPass && isPass) {
                                   trendHtml = '<span style="color: #28a745; font-weight: bold;">▲ IMPROVEMENT</span>';
+                              } else if (result.previousSubcases && result.subcases && result.subcases.total > 0) {
+                                  // Check subcase-level changes
+                                  const prevSc = result.previousSubcases;
+                                  const curSc = result.subcases;
+                                  let subcaseChange = null;
+                                  if (prevSc.passed !== undefined && prevSc.total !== undefined) {
+                                      if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
+                                          subcaseChange = { dir: 'regression', info: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}` };
+                                      } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
+                                          subcaseChange = { dir: 'improvement', info: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}` };
+                                      }
+                                  } else if (prevSc.failed !== undefined) {
+                                      const curFailed = curSc.failed || 0;
+                                      const prevFailed = prevSc.failed || 0;
+                                      if (curFailed > prevFailed) {
+                                          subcaseChange = { dir: 'regression', info: `${prevFailed} failed \u2192 ${curFailed} failed` };
+                                      } else if (curFailed < prevFailed) {
+                                          subcaseChange = { dir: 'improvement', info: `${prevFailed} failed \u2192 ${curFailed} failed` };
+                                      }
+                                  }
+                                  if (subcaseChange) {
+                                      if (subcaseChange.dir === 'regression') {
+                                          trendHtml = `<span style="color: #dc3545; font-weight: bold;">▼ REGRESSION</span><br><span style="font-size:11px;color:#856404;">[subcase: ${subcaseChange.info}]</span>`;
+                                      } else {
+                                          trendHtml = `<span style="color: #28a745; font-weight: bold;">▲ IMPROVEMENT</span><br><span style="font-size:11px;color:#856404;">[subcase: ${subcaseChange.info}]</span>`;
+                                      }
+                                  } else if (prev !== result.result) {
+                                      trendHtml = `<span style="color: #586069; font-size: 0.9em;">${prev} \u2192 ${result.result}</span>`;
+                                  } else {
+                                      trendHtml = '<span style="color: #ccc;">-</span>';
+                                  }
                               } else if (prev !== result.result) {
-                                  trendHtml = `<span style="color: #586069; font-size: 0.9em;">${prev} → ${result.result}</span>`;
+                                  trendHtml = `<span style="color: #586069; font-size: 0.9em;">${prev} \u2192 ${result.result}</span>`;
                               } else {
                                   trendHtml = '<span style="color: #ccc;">-</span>';
                               }

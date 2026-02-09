@@ -446,6 +446,7 @@ Examples:
                        r.configName = config.name;
                        r.device = config.device;
                        r.fullConfig = config;
+                       r.configIndex = idx;
                        // Determine identifiers for report matching
                        r.framework = fw;
                        // We use the dllResults (global for now, but usually reflects the first/main run)
@@ -522,9 +523,11 @@ Examples:
                                     // Skip non-result directories
                                     if (['temp', 'playwright', 'artifacts'].includes(f)) return false;
                                     // Accept bl- prefixed baseline dirs or pure timestamp dirs
-                                    if (f.startsWith('bl-')) return true;
-                                    if (/^\d+$/.test(f)) return true;
-                                    return false;
+                                    if (!f.startsWith('bl-') && !/^\d+$/.test(f)) return false;
+                                    // Must contain at least one .txt report file
+                                    const hasTextReport = fs.readdirSync(fullPath).some(c => c.endsWith('.txt'));
+                                    if (!hasTextReport) return false;
+                                    return true;
                                 })
                                 .sort((a, b) => {
                                     // Sort by timestamp portion (strip bl- prefix if present)
@@ -559,8 +562,9 @@ Examples:
                                // Parse content:
                                // [ort-gpu-nvidia]
                                // test1: PASS
-                               const baselineData = {}; // key -> Map<testName, status>
+                               const baselineData = {}; // key -> Map<testName, entry>
                                let currentKey = null;
+                               let lastEntryName = null; // track current test for counting subtest lines
 
                                const lines = content.split('\n');
                                for (const line of lines) {
@@ -569,18 +573,31 @@ Examples:
                                    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
                                        currentKey = trimmed.slice(1, -1);
                                        baselineData[currentKey] = {};
+                                       lastEntryName = null;
+                                   } else if (currentKey && trimmed.startsWith('- ')) {
+                                       // Subtest detail line (e.g., "  - subtestName: FAIL")
+                                       // Count as a failed subcase for the current test entry
+                                       if (lastEntryName && baselineData[currentKey][lastEntryName]) {
+                                           const entry = baselineData[currentKey][lastEntryName];
+                                           if (!entry.subcases) entry.subcases = { failed: 0 };
+                                           entry.subcases.failed = (entry.subcases.failed || 0) + 1;
+                                       }
                                    } else if (currentKey && trimmed.includes(':')) {
                                        // Robust parsing for "TestName: Status" where TestName might contain colons.
-                                       // We assume the Status does not contain colons and is at the end.
-                                       // Text report format: `${r.testName}: ${r.result}`
-                                       // Skip subteset detail lines (indented with "  - ")
-                                       if (trimmed.startsWith('- ')) continue;
                                        const lastColonIndex = trimmed.lastIndexOf(':');
                                        if (lastColonIndex !== -1) {
                                            const name = trimmed.substring(0, lastColonIndex).trim();
                                            const statusPart = trimmed.substring(lastColonIndex + 1).trim();
-                                           // Status might be "PASS", "FAIL", "TIMEOUT"
-                                           baselineData[currentKey][name] = statusPart.split(' ')[0];
+                                           // Parse status and optional subcase counts: "FAIL [10/15]" or "PASS [15/15]"
+                                           const statusMatch = statusPart.match(/^(\S+)(?:\s+\[(\d+)\/(\d+)\])?/);
+                                           if (statusMatch) {
+                                               const entry = { status: statusMatch[1] };
+                                               if (statusMatch[2] !== undefined) {
+                                                   entry.subcases = { passed: parseInt(statusMatch[2]), total: parseInt(statusMatch[3]) };
+                                               }
+                                               baselineData[currentKey][name] = entry;
+                                               lastEntryName = name;
+                                           }
                                        }
                                    }
                                }
@@ -591,8 +608,12 @@ Examples:
                                    // Construct key matching how text report generates it
                                    // key = `${r.framework}-${r.backend}-${r.deviceName}`
                                    const key = `${r.framework}-${r.backend}-${r.deviceName}`;
-                                   if (baselineData[key] && baselineData[key][r.testName]) {
-                                       r.previousResult = baselineData[key][r.testName];
+                                   const baseline = baselineData[key] && baselineData[key][r.testName];
+                                   if (baseline) {
+                                       r.previousResult = baseline.status;
+                                       if (baseline.subcases) {
+                                           r.previousSubcases = baseline.subcases;
+                                       }
                                        matchCount++;
                                    }
                                });
@@ -631,6 +652,9 @@ Examples:
                            let npuName = typeof sysNpuInfo === 'string' ? sysNpuInfo : sysNpuInfo.name;
                            if (npuName === 'Unknown NPU') npuName = 'None';
                            sysInfoText += `NPU: ${npuName}\n`;
+                           if (typeof sysNpuInfo === 'object' && sysNpuInfo.driver_ver) {
+                               sysInfoText += `NPU Driver: ${sysNpuInfo.driver_ver}\n`;
+                           }
                        }
                        sysInfoText += '==========================\n';
 
@@ -646,6 +670,10 @@ Examples:
 
                            const content = groupResults.map(r => {
                                let line = `${r.testName}: ${r.result}`;
+                               // Append subcase counts if available
+                               if (r.subcases && r.subcases.total > 0) {
+                                   line += ` [${r.subcases.passed}/${r.subcases.total}]`;
+                               }
                                // Append detailed failure messages for WPT if available
                                if (r.failedSubtests && r.failedSubtests.length > 0) {
                                    const subtestDetails = r.failedSubtests.map(s => `  - ${s.name}: ${s.status}`).join('\n');

@@ -168,6 +168,31 @@ node src/main.js --suite wpt --browser-arg "--webnn-ort-ep-device=WebGpuExecutio
 node src/main.js --suite wpt --browser-arg "--use-gl=angle --use-angle=gl"
 ```
 
+## Skip Retry
+
+By default, failed WPT test cases are retried automatically. Use `--skip-retry` to disable this behavior:
+
+```bash
+# Run without retrying failed cases
+node src/main.js --suite wpt --skip-retry
+```
+
+## Baseline Comparison
+
+Test results can be compared against a previous run (baseline) to detect regressions and improvements at both the case level and subcase level. By default, the most recent results directory containing a text report is used as the baseline.
+
+Use `--baseline` to specify a particular baseline folder:
+
+```bash
+# Compare against a specific baseline
+node src/main.js --suite wpt --baseline bl-20260209172945
+
+# Compare against a previous run by timestamp
+node src/main.js --suite wpt --baseline 20260208120000
+```
+
+Baseline directories are looked up under the `results/` folder. Directories prefixed with `bl-` are preferred over regular timestamp directories when auto-selecting a baseline.
+
 ## Test Reports
 
 ### HTML Report Generation
