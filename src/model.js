@@ -1,6 +1,9 @@
 
 const { WebNNRunner } = require('./util');
 const { expect } = require('@playwright/test');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 class ModelRunner extends WebNNRunner {
   constructor(page) {
@@ -741,63 +744,90 @@ class ModelRunner extends WebNNRunner {
         await this.page.goto(testUrl);
         await this.page.waitForLoadState('domcontentloaded');
 
-        // Look for Load button
-        const loadSelectors = [
-            '#load',
-            'button:has-text("Load")',
-            'button:text("Load")'
+        // The text-generation demo auto-loads the model on page init (no Load button).
+        // The send button (#send-button) starts disabled and becomes enabled when the model is ready.
+        const sendBtn = this.page.locator('#send-button');
+
+        console.log("Waiting for model to load (#send-button to become enabled)...");
+        await sendBtn.waitFor({ state: 'visible', timeout: 600000 });
+        await expect(sendBtn).not.toBeDisabled({ timeout: 600000 });
+        console.log("Model loaded. Send button is enabled.");
+
+        // Type a prompt into the #user-input contenteditable div
+        const userInput = this.page.locator('#user-input');
+        const testPrompt = 'What is 2 + 2?';
+        await userInput.click();
+        await userInput.fill(testPrompt).catch(async () => {
+            // contenteditable divs may not support fill(), use keyboard input
+            await userInput.pressSequentially(testPrompt, { delay: 30 });
+        });
+        console.log(`Typed prompt: "${testPrompt}"`);
+
+        // Listen for console errors that indicate EP/session failures
+        // so we can fail fast instead of waiting the full polling timeout.
+        // These patterns match specific WebNN/ORT error messages — keep them
+        // precise to avoid false-matching against routine log lines.
+        let epError = null;
+        const errorPatterns = [
+            "failed to create session",
+            "failed to execute 'readtensor' on 'mlcontext'",
+            "tensor has been destroyed or context is lost",
+            "failed to create context",
+            "session initialization failed",
         ];
+        const consoleErrorListener = (msg) => {
+            if (msg.type() === 'error' && !epError) {
+                const text = msg.text().toLowerCase();
+                for (const pattern of errorPatterns) {
+                    if (text.includes(pattern)) {
+                        epError = msg.text();
+                        console.log(`[Phi] Detected EP/inference error: ${msg.text()}`);
+                        break;
+                    }
+                }
+            }
+        };
+        this.page.on('console', consoleErrorListener);
 
-        let loadBtn = null;
-        for (const sel of loadSelectors) {
-             try { loadBtn = this.page.locator(sel).first(); if (await loadBtn.isVisible()) break; } catch(e){}
-        }
+        try {
+          // Click send button to submit the prompt
+          await sendBtn.click();
+          console.log("Clicked Send button, waiting for response...");
 
-        if (loadBtn) {
-            await loadBtn.click();
-            console.log("Clicked Load button");
-        } else {
-            console.log("Load button not found, assuming auto-load or different UI");
-        }
+          // Wait for performance indicator to show tokens/sec data
+          const perfIndicator = this.page.locator('#performance-indicator');
 
-        // Wait quite a while for model load - look for generation start capability or input
-        const generateBtnSelector = '#generate';
-        const generateBtn = this.page.locator(generateBtnSelector);
-
-        console.log("Waiting for Generate button enabled (Model loading)...");
-        await generateBtn.waitFor({ state: 'visible', timeout: 600000 });
-        // Check if disabled removal happens
-        await expect(generateBtn).not.toBeDisabled({ timeout: 600000 });
-
-        console.log("Model Loaded. Clicking Generate...");
-        await generateBtn.click();
-
-        // Check for tokens/sec or latency
-        const tokenSelector = '#tokens';
-        const tokenEl = this.page.locator(tokenSelector);
-        await tokenEl.waitFor({ state: 'visible', timeout: 120000 });
-
-        let tokenText = '';
-        let checks = 0;
-        while(checks < 300) { // 2.5 mins
-            tokenText = await tokenEl.innerText();
-            if (tokenText && /\d/.test(tokenText)) {
-                 break;
+          let perfText = '';
+          let checks = 0;
+          while(checks < 600) { // 5 mins max
+            // Fail fast if we detected an EP/inference error
+            if (epError) {
+              throw new Error(`Inference failed (EP error): ${epError}`);
+            }
+            perfText = await perfIndicator.innerText().catch(() => '');
+            if (perfText && /\d/.test(perfText) && (perfText.includes('token') || perfText.includes('s'))) {
+               break;
             }
             await this.page.waitForTimeout(500);
             checks++;
-        }
+          }
 
-        if (!tokenText) throw new Error("No token/sec result found");
+          if (epError) throw new Error(`Inference failed (EP error): ${epError}`);
+          if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
 
-        results.push({
+          console.log(`Performance result: ${perfText}`);
+          results.push({
             testName: testName,
             testUrl: testUrl,
             result: 'PASS',
-            details: `Tokens: ${tokenText}`,
+            details: `Performance: ${perfText.replace(/\n/g, ', ')}`,
             subcases: { total: 1, passed: 1, failed: 0 },
             suite: 'model'
-        });
+          });
+        } finally {
+          // Clean up listener even on early errors
+          try { this.page.removeListener('console', consoleErrorListener); } catch(e) {}
+        }
 
       } catch (e) { throw e; }
   }
@@ -866,13 +896,49 @@ class ModelRunner extends WebNNRunner {
     } catch(e) { throw e; }
   }
 
+  /**
+   * Generate a test WAV file with spoken words using Windows TTS (System.Speech).
+   * Throws if TTS is unavailable — no fallback.
+   * @param {string} text - Text to speak
+   * @returns {{ wavPath: string, expectedWords: string[] }} Path to WAV and words to verify in transcription
+   */
+  _generateSpokenWav(text = 'The quick brown fox jumps over the lazy dog') {
+      const { execSync } = require('child_process');
+      const tempWavPath = path.join(os.tmpdir(), `webnn-test-speech-${Date.now()}.wav`);
+      const expectedWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+
+      // Use Windows built-in System.Speech TTS to generate a spoken WAV file.
+      // Escape single quotes in the text for PowerShell.
+      const safeText = text.replace(/'/g, "''");
+      const psCmd = [
+          `Add-Type -AssemblyName System.Speech;`,
+          `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;`,
+          `$synth.SetOutputToWaveFile('${tempWavPath}');`,
+          `$synth.Speak('${safeText}');`,
+          `$synth.Dispose();`,
+          `Write-Host 'OK'`
+      ].join(' ');
+      const result = execSync(`powershell -NoProfile -c "${psCmd}"`, {
+          encoding: 'utf8',
+          timeout: 15000
+      }).trim();
+
+      if (!result.includes('OK') || !fs.existsSync(tempWavPath)) {
+          throw new Error('TTS WAV generation failed — file was not created');
+      }
+
+      const size = fs.statSync(tempWavPath).size;
+      console.log(`[Whisper] Generated TTS WAV: "${text}" -> ${tempWavPath} (${size} bytes)`);
+      return { wavPath: tempWavPath, expectedWords };
+  }
+
   async runModelWhisper(results, modelDef) {
       const testName = modelDef.name;
       const device = process.env.DEVICE || 'cpu';
 
-      // Construct URL: ?devicetype=<device>
+      // Construct URL: ?provider=webnn&devicetype=<device>
       const baseUrl = modelDef.url.split('?')[0];
-      const testUrl = `${baseUrl}?devicetype=${device}`;
+      const testUrl = `${baseUrl}?provider=webnn&devicetype=${device}`;
 
       console.log(`Running preview test: ${testName} on ${device}`);
       console.log(`Navigating to: ${testUrl}`);
@@ -881,52 +947,94 @@ class ModelRunner extends WebNNRunner {
           await this.page.goto(testUrl);
           await this.page.waitForLoadState('domcontentloaded');
 
-          // Wait for load
-          const status = this.page.locator('#status');
+          // The whisper-base demo auto-loads the model on page init (no Load button).
+          // When the model is ready, controls like #file-upload become enabled.
+          const fileUpload = this.page.locator('#file-upload');
 
-          // There might be a Load button or auto load
-          // Demo specific: Usually "Load Model" button
-          const loadBtn = this.page.locator('button', { hasText: 'Load' });
-          if (await loadBtn.isVisible()) {
-              await loadBtn.click();
+          console.log("Waiting for model to load (#file-upload to become enabled)...");
+          await fileUpload.waitFor({ state: 'attached', timeout: 300000 });
+          // Poll for the input to become enabled
+          let modelReady = false;
+          for (let i = 0; i < 600; i++) { // up to 5 min
+            const isDisabled = await fileUpload.isDisabled();
+            if (!isDisabled) { modelReady = true; break; }
+            await this.page.waitForTimeout(500);
           }
+          if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
+          console.log("Model loaded. Controls are enabled.");
 
-          // Wait for Ready
-          console.log("Waiting for model ready...");
-          // This can take time.
-          await this.page.waitForTimeout(10000);
+          // Generate a spoken WAV file using Windows TTS and upload it.
+          // This avoids needing microphone permissions and tests real transcription.
+          const { wavPath: tempWavPath, expectedWords } = this._generateSpokenWav(
+              'The quick brown fox jumps over the lazy dog'
+          );
 
-          // Usually there is "Run" or "Transcribe" from audio file
-          // Need to select audio file or check defaults.
-          // Assuming there is a "Run" button for default sample
-          const runBtn = this.page.locator('button', { hasText: 'Run' }).or(this.page.locator('button', { hasText: 'Transcribe' }));
+          try {
+            // Upload via the file input
+            await fileUpload.setInputFiles(tempWavPath);
+            console.log("Uploaded WAV file. Waiting for transcription...");
 
-          await runBtn.waitFor({ state: 'visible', timeout: 300000 });
-          await runBtn.click();
+            // Wait for transcription output in #outputText
+            const outputText = this.page.locator('#outputText');
+            const latencyEl = this.page.locator('#latency');
 
-          // Check output
-          const output = this.page.locator('#output').or(this.page.locator('#result'));
-          await output.waitFor({ state: 'visible', timeout: 60000 });
-
-          let text = '';
-          let checks = 0;
-          while(checks < 60) {
-              text = await output.textContent();
-              if (text && text.trim().length > 5) break;
+            let latencyText = '';
+            let checks = 0;
+            while(checks < 120) { // up to 60 seconds
+              latencyText = await latencyEl.innerText().catch(() => '');
+              // Transcription is done when latency shows 100% or a completion indicator
+              if (latencyText && latencyText.includes('100')) {
+                break;
+              }
               await this.page.waitForTimeout(500);
               checks++;
-          }
+            }
 
-          if (!text) throw new Error("No transcription result");
+            const transcription = await outputText.textContent().catch(() => '');
+            console.log(`Transcription result: "${transcription}"`);
+            console.log(`Latency info: ${latencyText}`);
 
-          results.push({
+            // Consider it a pass if the transcription completed (latency hit 100%)
+            if (!latencyText || !latencyText.includes('100')) {
+              throw new Error("Transcription did not complete (latency never reached 100%)");
+            }
+
+            // Check if expected words appear in the transcription.
+            // Require at least 2 out of 5 expected words to consider transcription valid.
+            const MIN_WORD_MATCHES = 2;
+            let matchedWords = [];
+            if (expectedWords.length > 0 && transcription) {
+              const lower = transcription.toLowerCase();
+              matchedWords = expectedWords.filter(w => lower.includes(w));
+              console.log(`[Whisper] Word match: ${matchedWords.length}/${expectedWords.length} expected words found`);
+              if (matchedWords.length > 0) {
+                console.log(`[Whisper] Matched: ${matchedWords.join(', ')}`);
+              }
+            }
+
+            const wordMatchInfo = expectedWords.length > 0
+              ? ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`
+              : '';
+
+            const transcriptionOk = expectedWords.length === 0 || matchedWords.length >= MIN_WORD_MATCHES;
+            const result = transcriptionOk ? 'PASS' : 'FAIL';
+
+            if (!transcriptionOk) {
+              console.log(`[Whisper] FAIL: Only ${matchedWords.length}/${expectedWords.length} words matched (need >= ${MIN_WORD_MATCHES})`);
+            }
+
+            results.push({
               testName: testName,
               testUrl: testUrl,
-              result: 'PASS',
-              details: "Transcription success",
-              subcases: { total: 1, passed: 1, failed: 0 },
+              result: result,
+              details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
+              subcases: { total: 1, passed: transcriptionOk ? 1 : 0, failed: transcriptionOk ? 0 : 1 },
               suite: 'model'
-          });
+            });
+          } finally {
+            // Clean up temp file
+            try { fs.unlinkSync(tempWavPath); } catch(e) {}
+          }
 
       } catch(e) { throw e; }
   }
