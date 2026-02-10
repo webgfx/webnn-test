@@ -781,43 +781,45 @@ class ModelRunner extends WebNNRunner {
         };
         this.page.on('console', consoleErrorListener);
 
-        // Click send button to submit the prompt
-        await sendBtn.click();
-        console.log("Clicked Send button, waiting for response...");
+        try {
+          // Click send button to submit the prompt
+          await sendBtn.click();
+          console.log("Clicked Send button, waiting for response...");
 
-        // Wait for performance indicator to show tokens/sec data
-        const perfIndicator = this.page.locator('#performance-indicator');
+          // Wait for performance indicator to show tokens/sec data
+          const perfIndicator = this.page.locator('#performance-indicator');
 
-        let perfText = '';
-        let checks = 0;
-        while(checks < 600) { // 5 mins max
+          let perfText = '';
+          let checks = 0;
+          while(checks < 600) { // 5 mins max
             // Fail fast if we detected an EP/inference error
             if (epError) {
-                throw new Error(`Inference failed (EP error): ${epError}`);
+              throw new Error(`Inference failed (EP error): ${epError}`);
             }
             perfText = await perfIndicator.innerText().catch(() => '');
             if (perfText && /\d/.test(perfText) && (perfText.includes('token') || perfText.includes('s'))) {
-                 break;
+               break;
             }
             await this.page.waitForTimeout(500);
             checks++;
-        }
+          }
 
-        // Clean up listener
-        try { this.page.removeListener('console', consoleErrorListener); } catch(e) {}
+          if (epError) throw new Error(`Inference failed (EP error): ${epError}`);
+          if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
 
-        if (epError) throw new Error(`Inference failed (EP error): ${epError}`);
-        if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
-
-        console.log(`Performance result: ${perfText}`);
-        results.push({
+          console.log(`Performance result: ${perfText}`);
+          results.push({
             testName: testName,
             testUrl: testUrl,
             result: 'PASS',
             details: `Performance: ${perfText.replace(/\n/g, ', ')}`,
             subcases: { total: 1, passed: 1, failed: 0 },
             suite: 'model'
-        });
+          });
+        } finally {
+          // Clean up listener even on early errors
+          try { this.page.removeListener('console', consoleErrorListener); } catch(e) {}
+        }
 
       } catch (e) { throw e; }
   }
@@ -983,9 +985,9 @@ class ModelRunner extends WebNNRunner {
           // Poll for the input to become enabled
           let modelReady = false;
           for (let i = 0; i < 600; i++) { // up to 5 min
-              const isDisabled = await fileUpload.isDisabled();
-              if (!isDisabled) { modelReady = true; break; }
-              await this.page.waitForTimeout(500);
+            const isDisabled = await fileUpload.isDisabled();
+            if (!isDisabled) { modelReady = true; break; }
+            await this.page.waitForTimeout(500);
           }
           if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
           console.log("Model loaded. Controls are enabled.");
@@ -996,61 +998,63 @@ class ModelRunner extends WebNNRunner {
               'The quick brown fox jumps over the lazy dog'
           );
 
-          // Upload via the file input
-          await fileUpload.setInputFiles(tempWavPath);
-          console.log("Uploaded WAV file. Waiting for transcription...");
+          try {
+            // Upload via the file input
+            await fileUpload.setInputFiles(tempWavPath);
+            console.log("Uploaded WAV file. Waiting for transcription...");
 
-          // Wait for transcription output in #outputText
-          const outputText = this.page.locator('#outputText');
-          const latencyEl = this.page.locator('#latency');
+            // Wait for transcription output in #outputText
+            const outputText = this.page.locator('#outputText');
+            const latencyEl = this.page.locator('#latency');
 
-          let latencyText = '';
-          let checks = 0;
-          while(checks < 120) { // up to 60 seconds
+            let latencyText = '';
+            let checks = 0;
+            while(checks < 120) { // up to 60 seconds
               latencyText = await latencyEl.innerText().catch(() => '');
               // Transcription is done when latency shows 100% or a completion indicator
               if (latencyText && latencyText.includes('100')) {
-                  break;
+                break;
               }
               await this.page.waitForTimeout(500);
               checks++;
-          }
+            }
 
-          const transcription = await outputText.textContent().catch(() => '');
-          console.log(`Transcription result: "${transcription}"`);
-          console.log(`Latency info: ${latencyText}`);
+            const transcription = await outputText.textContent().catch(() => '');
+            console.log(`Transcription result: "${transcription}"`);
+            console.log(`Latency info: ${latencyText}`);
 
-          // Clean up temp file
-          try { fs.unlinkSync(tempWavPath); } catch(e) {}
-
-          // Consider it a pass if the transcription completed (latency hit 100%)
-          if (!latencyText || !latencyText.includes('100')) {
+            // Consider it a pass if the transcription completed (latency hit 100%)
+            if (!latencyText || !latencyText.includes('100')) {
               throw new Error("Transcription did not complete (latency never reached 100%)");
-          }
+            }
 
-          // Check if any expected words appear in the transcription (if TTS was used)
-          let matchedWords = [];
-          if (expectedWords.length > 0 && transcription) {
+            // Check if any expected words appear in the transcription (if TTS was used)
+            let matchedWords = [];
+            if (expectedWords.length > 0 && transcription) {
               const lower = transcription.toLowerCase();
               matchedWords = expectedWords.filter(w => lower.includes(w));
               console.log(`[Whisper] Word match: ${matchedWords.length}/${expectedWords.length} expected words found`);
               if (matchedWords.length > 0) {
-                  console.log(`[Whisper] Matched: ${matchedWords.join(', ')}`);
+                console.log(`[Whisper] Matched: ${matchedWords.join(', ')}`);
               }
-          }
+            }
 
-          const wordMatchInfo = expectedWords.length > 0
+            const wordMatchInfo = expectedWords.length > 0
               ? ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`
               : '';
 
-          results.push({
+            results.push({
               testName: testName,
               testUrl: testUrl,
               result: 'PASS',
               details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
               subcases: { total: 1, passed: 1, failed: 0 },
               suite: 'model'
-          });
+            });
+          } finally {
+            // Clean up temp file
+            try { fs.unlinkSync(tempWavPath); } catch(e) {}
+          }
 
       } catch(e) { throw e; }
   }
