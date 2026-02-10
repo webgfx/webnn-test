@@ -536,11 +536,8 @@ Examples:
                                     return tsB.localeCompare(tsA); // Newest first
                                 });
 
-                           // Prefer bl- prefixed (explicit baseline) over regular runs
-                           const blDir = dirs.find(d => d.startsWith('bl-'));
-                           if (blDir) {
-                               baselineDirName = blDir;
-                           } else if (dirs.length > 0) {
+                           // Use the latest directory (already sorted newest first)
+                           if (dirs.length > 0) {
                                baselineDirName = dirs[0];
                            }
                        }
