@@ -765,8 +765,16 @@ class ModelRunner extends WebNNRunner {
 
         // Listen for console errors that indicate EP/session failures
         // so we can fail fast instead of waiting the full polling timeout.
+        // These patterns match specific WebNN/ORT error messages — keep them
+        // precise to avoid false-matching against routine log lines.
         let epError = null;
-        const errorPatterns = ['failed to create session', 'readtensor', 'tensor has been destroyed', 'context is lost', 'inference failed'];
+        const errorPatterns = [
+            "failed to create session",
+            "failed to execute 'readtensor' on 'mlcontext'",
+            "tensor has been destroyed or context is lost",
+            "failed to create context",
+            "session initialization failed",
+        ];
         const consoleErrorListener = (msg) => {
             if (msg.type() === 'error' && !epError) {
                 const text = msg.text().toLowerCase();
@@ -991,7 +999,9 @@ class ModelRunner extends WebNNRunner {
               throw new Error("Transcription did not complete (latency never reached 100%)");
             }
 
-            // Check if any expected words appear in the transcription (if TTS was used)
+            // Check if expected words appear in the transcription.
+            // Require at least 2 out of 5 expected words to consider transcription valid.
+            const MIN_WORD_MATCHES = 2;
             let matchedWords = [];
             if (expectedWords.length > 0 && transcription) {
               const lower = transcription.toLowerCase();
@@ -1006,12 +1016,19 @@ class ModelRunner extends WebNNRunner {
               ? ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`
               : '';
 
+            const transcriptionOk = expectedWords.length === 0 || matchedWords.length >= MIN_WORD_MATCHES;
+            const result = transcriptionOk ? 'PASS' : 'FAIL';
+
+            if (!transcriptionOk) {
+              console.log(`[Whisper] FAIL: Only ${matchedWords.length}/${expectedWords.length} words matched (need >= ${MIN_WORD_MATCHES})`);
+            }
+
             results.push({
               testName: testName,
               testUrl: testUrl,
-              result: 'PASS',
+              result: result,
               details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
-              subcases: { total: 1, passed: 1, failed: 0 },
+              subcases: { total: 1, passed: transcriptionOk ? 1 : 0, failed: transcriptionOk ? 0 : 1 },
               suite: 'model'
             });
           } finally {
