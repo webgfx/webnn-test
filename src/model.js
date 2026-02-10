@@ -889,8 +889,8 @@ class ModelRunner extends WebNNRunner {
   }
 
   /**
-   * Generate a test WAV file with spoken words using Windows TTS.
-   * Falls back to a sine wave tone if TTS is unavailable (non-Windows).
+   * Generate a test WAV file with spoken words using Windows TTS (System.Speech).
+   * Throws if TTS is unavailable — no fallback.
    * @param {string} text - Text to speak
    * @returns {{ wavPath: string, expectedWords: string[] }} Path to WAV and words to verify in transcription
    */
@@ -899,66 +899,29 @@ class ModelRunner extends WebNNRunner {
       const tempWavPath = path.join(os.tmpdir(), `webnn-test-speech-${Date.now()}.wav`);
       const expectedWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 3);
 
-      if (os.platform() === 'win32') {
-          try {
-              // Use Windows built-in System.Speech TTS to generate a spoken WAV file.
-              // Escape single quotes in the text for PowerShell.
-              const safeText = text.replace(/'/g, "''");
-              const psCmd = [
-                  `Add-Type -AssemblyName System.Speech;`,
-                  `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;`,
-                  `$synth.SetOutputToWaveFile('${tempWavPath}');`,
-                  `$synth.Speak('${safeText}');`,
-                  `$synth.Dispose();`,
-                  `Write-Host 'OK'`
-              ].join(' ');
-              const result = execSync(`powershell -NoProfile -c "${psCmd}"`, {
-                  encoding: 'utf8',
-                  timeout: 15000
-              }).trim();
+      // Use Windows built-in System.Speech TTS to generate a spoken WAV file.
+      // Escape single quotes in the text for PowerShell.
+      const safeText = text.replace(/'/g, "''");
+      const psCmd = [
+          `Add-Type -AssemblyName System.Speech;`,
+          `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;`,
+          `$synth.SetOutputToWaveFile('${tempWavPath}');`,
+          `$synth.Speak('${safeText}');`,
+          `$synth.Dispose();`,
+          `Write-Host 'OK'`
+      ].join(' ');
+      const result = execSync(`powershell -NoProfile -c "${psCmd}"`, {
+          encoding: 'utf8',
+          timeout: 15000
+      }).trim();
 
-              if (result.includes('OK') && fs.existsSync(tempWavPath)) {
-                  const size = fs.statSync(tempWavPath).size;
-                  console.log(`[Whisper] Generated TTS WAV: "${text}" -> ${tempWavPath} (${size} bytes)`);
-                  return { wavPath: tempWavPath, expectedWords };
-              }
-          } catch (e) {
-              console.log(`[Whisper] TTS generation failed: ${e.message}. Falling back to sine wave.`);
-          }
+      if (!result.includes('OK') || !fs.existsSync(tempWavPath)) {
+          throw new Error('TTS WAV generation failed — file was not created');
       }
 
-      // Fallback: generate a 2-second sine wave (won't produce meaningful transcription)
-      console.log('[Whisper] TTS unavailable, generating sine wave fallback');
-      const sampleRate = 16000;
-      const durationSec = 2;
-      const frequency = 440;
-      const numSamples = sampleRate * durationSec;
-      const bytesPerSample = 2;
-      const dataSize = numSamples * bytesPerSample;
-      const buffer = Buffer.alloc(44 + dataSize);
-
-      buffer.write('RIFF', 0);
-      buffer.writeUInt32LE(36 + dataSize, 4);
-      buffer.write('WAVE', 8);
-      buffer.write('fmt ', 12);
-      buffer.writeUInt32LE(16, 16);
-      buffer.writeUInt16LE(1, 20);
-      buffer.writeUInt16LE(1, 22);
-      buffer.writeUInt32LE(sampleRate, 24);
-      buffer.writeUInt32LE(sampleRate * bytesPerSample, 28);
-      buffer.writeUInt16LE(bytesPerSample, 32);
-      buffer.writeUInt16LE(16, 34);
-      buffer.write('data', 36);
-      buffer.writeUInt32LE(dataSize, 40);
-
-      for (let i = 0; i < numSamples; i++) {
-          const sample = Math.sin(2 * Math.PI * frequency * i / sampleRate);
-          const intSample = Math.max(-32768, Math.min(32767, Math.round(sample * 32767 * 0.5)));
-          buffer.writeInt16LE(intSample, 44 + i * bytesPerSample);
-      }
-
-      fs.writeFileSync(tempWavPath, buffer);
-      return { wavPath: tempWavPath, expectedWords: [] }; // no words to verify for tone
+      const size = fs.statSync(tempWavPath).size;
+      console.log(`[Whisper] Generated TTS WAV: "${text}" -> ${tempWavPath} (${size} bytes)`);
+      return { wavPath: tempWavPath, expectedWords };
   }
 
   async runModelWhisper(results, modelDef) {
