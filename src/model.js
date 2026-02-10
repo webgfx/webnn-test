@@ -887,42 +887,76 @@ class ModelRunner extends WebNNRunner {
   }
 
   /**
-   * Generate a minimal WAV file buffer containing a short sine wave tone.
-   * This avoids needing microphone permissions for the Whisper test.
-   * @param {number} durationSec - Duration in seconds
-   * @param {number} sampleRate - Sample rate (Whisper expects 16kHz)
-   * @param {number} frequency - Tone frequency in Hz
-   * @returns {Buffer} WAV file as a Node.js Buffer
+   * Generate a test WAV file with spoken words using Windows TTS.
+   * Falls back to a sine wave tone if TTS is unavailable (non-Windows).
+   * @param {string} text - Text to speak
+   * @returns {{ wavPath: string, expectedWords: string[] }} Path to WAV and words to verify in transcription
    */
-  _generateTestWav(durationSec = 2, sampleRate = 16000, frequency = 440) {
-      const numSamples = sampleRate * durationSec;
-      const bytesPerSample = 2; // 16-bit PCM
-      const dataSize = numSamples * bytesPerSample;
-      const buffer = Buffer.alloc(44 + dataSize); // 44 = WAV header size
+  _generateSpokenWav(text = 'The quick brown fox jumps over the lazy dog') {
+      const { execSync } = require('child_process');
+      const tempWavPath = path.join(os.tmpdir(), `webnn-test-speech-${Date.now()}.wav`);
+      const expectedWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 3);
 
-      // WAV header
+      if (os.platform() === 'win32') {
+          try {
+              // Use Windows built-in System.Speech TTS to generate a spoken WAV file.
+              // Escape single quotes in the text for PowerShell.
+              const safeText = text.replace(/'/g, "''");
+              const psCmd = [
+                  `Add-Type -AssemblyName System.Speech;`,
+                  `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;`,
+                  `$synth.SetOutputToWaveFile('${tempWavPath}');`,
+                  `$synth.Speak('${safeText}');`,
+                  `$synth.Dispose();`,
+                  `Write-Host 'OK'`
+              ].join(' ');
+              const result = execSync(`powershell -NoProfile -c "${psCmd}"`, {
+                  encoding: 'utf8',
+                  timeout: 15000
+              }).trim();
+
+              if (result.includes('OK') && fs.existsSync(tempWavPath)) {
+                  const size = fs.statSync(tempWavPath).size;
+                  console.log(`[Whisper] Generated TTS WAV: "${text}" -> ${tempWavPath} (${size} bytes)`);
+                  return { wavPath: tempWavPath, expectedWords };
+              }
+          } catch (e) {
+              console.log(`[Whisper] TTS generation failed: ${e.message}. Falling back to sine wave.`);
+          }
+      }
+
+      // Fallback: generate a 2-second sine wave (won't produce meaningful transcription)
+      console.log('[Whisper] TTS unavailable, generating sine wave fallback');
+      const sampleRate = 16000;
+      const durationSec = 2;
+      const frequency = 440;
+      const numSamples = sampleRate * durationSec;
+      const bytesPerSample = 2;
+      const dataSize = numSamples * bytesPerSample;
+      const buffer = Buffer.alloc(44 + dataSize);
+
       buffer.write('RIFF', 0);
-      buffer.writeUInt32LE(36 + dataSize, 4);      // file size - 8
+      buffer.writeUInt32LE(36 + dataSize, 4);
       buffer.write('WAVE', 8);
       buffer.write('fmt ', 12);
-      buffer.writeUInt32LE(16, 16);                  // fmt chunk size
-      buffer.writeUInt16LE(1, 20);                   // PCM format
-      buffer.writeUInt16LE(1, 22);                   // mono
-      buffer.writeUInt32LE(sampleRate, 24);           // sample rate
-      buffer.writeUInt32LE(sampleRate * bytesPerSample, 28); // byte rate
-      buffer.writeUInt16LE(bytesPerSample, 32);      // block align
-      buffer.writeUInt16LE(16, 34);                  // bits per sample
+      buffer.writeUInt32LE(16, 16);
+      buffer.writeUInt16LE(1, 20);
+      buffer.writeUInt16LE(1, 22);
+      buffer.writeUInt32LE(sampleRate, 24);
+      buffer.writeUInt32LE(sampleRate * bytesPerSample, 28);
+      buffer.writeUInt16LE(bytesPerSample, 32);
+      buffer.writeUInt16LE(16, 34);
       buffer.write('data', 36);
-      buffer.writeUInt32LE(dataSize, 40);             // data chunk size
+      buffer.writeUInt32LE(dataSize, 40);
 
-      // Write sine wave samples (16-bit signed PCM)
       for (let i = 0; i < numSamples; i++) {
           const sample = Math.sin(2 * Math.PI * frequency * i / sampleRate);
-          const intSample = Math.max(-32768, Math.min(32767, Math.round(sample * 32767 * 0.5))); // 50% volume
+          const intSample = Math.max(-32768, Math.min(32767, Math.round(sample * 32767 * 0.5)));
           buffer.writeInt16LE(intSample, 44 + i * bytesPerSample);
       }
 
-      return buffer;
+      fs.writeFileSync(tempWavPath, buffer);
+      return { wavPath: tempWavPath, expectedWords: [] }; // no words to verify for tone
   }
 
   async runModelWhisper(results, modelDef) {
@@ -956,12 +990,11 @@ class ModelRunner extends WebNNRunner {
           if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
           console.log("Model loaded. Controls are enabled.");
 
-          // Generate a short test WAV file (2 second 440Hz tone) and upload it.
-          // This avoids needing microphone permissions.
-          const wavBuffer = this._generateTestWav(2, 16000, 440);
-          const tempWavPath = path.join(os.tmpdir(), `webnn-test-tone-${Date.now()}.wav`);
-          fs.writeFileSync(tempWavPath, wavBuffer);
-          console.log(`Generated test WAV file: ${tempWavPath} (${wavBuffer.length} bytes)`);
+          // Generate a spoken WAV file using Windows TTS and upload it.
+          // This avoids needing microphone permissions and tests real transcription.
+          const { wavPath: tempWavPath, expectedWords } = this._generateSpokenWav(
+              'The quick brown fox jumps over the lazy dog'
+          );
 
           // Upload via the file input
           await fileUpload.setInputFiles(tempWavPath);
@@ -995,11 +1028,26 @@ class ModelRunner extends WebNNRunner {
               throw new Error("Transcription did not complete (latency never reached 100%)");
           }
 
+          // Check if any expected words appear in the transcription (if TTS was used)
+          let matchedWords = [];
+          if (expectedWords.length > 0 && transcription) {
+              const lower = transcription.toLowerCase();
+              matchedWords = expectedWords.filter(w => lower.includes(w));
+              console.log(`[Whisper] Word match: ${matchedWords.length}/${expectedWords.length} expected words found`);
+              if (matchedWords.length > 0) {
+                  console.log(`[Whisper] Matched: ${matchedWords.join(', ')}`);
+              }
+          }
+
+          const wordMatchInfo = expectedWords.length > 0
+              ? ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`
+              : '';
+
           results.push({
               testName: testName,
               testUrl: testUrl,
               result: 'PASS',
-              details: `Transcription: ${transcription || '(tone/blank)'}. ${latencyText}`,
+              details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
               subcases: { total: 1, passed: 1, failed: 0 },
               suite: 'model'
           });
