@@ -3,7 +3,6 @@ const { WebNNRunner } = require('./util');
 const { expect } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
 class ModelRunner extends WebNNRunner {
   constructor(page) {
@@ -896,42 +895,6 @@ class ModelRunner extends WebNNRunner {
     } catch(e) { throw e; }
   }
 
-  /**
-   * Generate a test WAV file with spoken words using Windows TTS (System.Speech).
-   * Throws if TTS is unavailable — no fallback.
-   * @param {string} text - Text to speak
-   * @returns {{ wavPath: string, expectedWords: string[] }} Path to WAV and words to verify in transcription
-   */
-  _generateSpokenWav(text = 'The quick brown fox jumps over the lazy dog') {
-      const { execSync } = require('child_process');
-      const tempWavPath = path.join(os.tmpdir(), `webnn-test-speech-${Date.now()}.wav`);
-      const expectedWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-
-      // Use Windows built-in System.Speech TTS to generate a spoken WAV file.
-      // Escape single quotes in the text for PowerShell.
-      const safeText = text.replace(/'/g, "''");
-      const psCmd = [
-          `Add-Type -AssemblyName System.Speech;`,
-          `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;`,
-          `$synth.SetOutputToWaveFile('${tempWavPath}');`,
-          `$synth.Speak('${safeText}');`,
-          `$synth.Dispose();`,
-          `Write-Host 'OK'`
-      ].join(' ');
-      const result = execSync(`powershell -NoProfile -c "${psCmd}"`, {
-          encoding: 'utf8',
-          timeout: 15000
-      }).trim();
-
-      if (!result.includes('OK') || !fs.existsSync(tempWavPath)) {
-          throw new Error('TTS WAV generation failed — file was not created');
-      }
-
-      const size = fs.statSync(tempWavPath).size;
-      console.log(`[Whisper] Generated TTS WAV: "${text}" -> ${tempWavPath} (${size} bytes)`);
-      return { wavPath: tempWavPath, expectedWords };
-  }
-
   async runModelWhisper(results, modelDef) {
       const testName = modelDef.name;
       const device = process.env.DEVICE || 'cpu';
@@ -963,13 +926,12 @@ class ModelRunner extends WebNNRunner {
           if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
           console.log("Model loaded. Controls are enabled.");
 
-          // Generate a spoken WAV file using Windows TTS and upload it.
-          // This avoids needing microphone permissions and tests real transcription.
-          const { wavPath: tempWavPath, expectedWords } = this._generateSpokenWav(
-              'The quick brown fox jumps over the lazy dog'
-          );
+          // Use the static test WAV file from assets/
+          const tempWavPath = path.join(__dirname, '..', 'assets', 'test.wav');
+          if (!fs.existsSync(tempWavPath)) {
+              throw new Error(`Test WAV file not found: ${tempWavPath}`);
+          }
 
-          try {
             // Upload via the file input
             await fileUpload.setInputFiles(tempWavPath);
             console.log("Uploaded WAV file. Waiting for transcription...");
@@ -1000,10 +962,12 @@ class ModelRunner extends WebNNRunner {
             }
 
             // Check if expected words appear in the transcription.
-            // Require at least 2 out of 5 expected words to consider transcription valid.
+            // The test.wav contains "What's the weather like?"
+            const expectedText = "What's the weather like?";
+            const expectedWords = expectedText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
             const MIN_WORD_MATCHES = 2;
             let matchedWords = [];
-            if (expectedWords.length > 0 && transcription) {
+            if (transcription) {
               const lower = transcription.toLowerCase();
               matchedWords = expectedWords.filter(w => lower.includes(w));
               console.log(`[Whisper] Word match: ${matchedWords.length}/${expectedWords.length} expected words found`);
@@ -1012,12 +976,8 @@ class ModelRunner extends WebNNRunner {
               }
             }
 
-            const wordMatchInfo = expectedWords.length > 0
-              ? ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`
-              : '';
-
-            const transcriptionOk = expectedWords.length === 0 || matchedWords.length >= MIN_WORD_MATCHES;
-            const result = transcriptionOk ? 'PASS' : 'FAIL';
+            const wordMatchInfo = ` | Words matched: ${matchedWords.length}/${expectedWords.length} (${matchedWords.join(', ') || 'none'})`;
+            const transcriptionOk = matchedWords.length >= MIN_WORD_MATCHES;
 
             if (!transcriptionOk) {
               console.log(`[Whisper] FAIL: Only ${matchedWords.length}/${expectedWords.length} words matched (need >= ${MIN_WORD_MATCHES})`);
@@ -1026,15 +986,11 @@ class ModelRunner extends WebNNRunner {
             results.push({
               testName: testName,
               testUrl: testUrl,
-              result: result,
+              result: transcriptionOk ? 'PASS' : 'FAIL',
               details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
               subcases: { total: 1, passed: transcriptionOk ? 1 : 0, failed: transcriptionOk ? 0 : 1 },
               suite: 'model'
             });
-          } finally {
-            // Clean up temp file
-            try { fs.unlinkSync(tempWavPath); } catch(e) {}
-          }
 
       } catch(e) { throw e; }
   }
