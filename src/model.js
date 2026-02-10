@@ -1,6 +1,9 @@
 
 const { WebNNRunner } = require('./util');
 const { expect } = require('@playwright/test');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 class ModelRunner extends WebNNRunner {
   constructor(page) {
@@ -760,6 +763,24 @@ class ModelRunner extends WebNNRunner {
         });
         console.log(`Typed prompt: "${testPrompt}"`);
 
+        // Listen for console errors that indicate EP/session failures
+        // so we can fail fast instead of waiting the full polling timeout.
+        let epError = null;
+        const errorPatterns = ['failed to create session', 'readtensor', 'tensor has been destroyed', 'context is lost', 'inference failed'];
+        const consoleErrorListener = (msg) => {
+            if (msg.type() === 'error' && !epError) {
+                const text = msg.text().toLowerCase();
+                for (const pattern of errorPatterns) {
+                    if (text.includes(pattern)) {
+                        epError = msg.text();
+                        console.log(`[Phi] Detected EP/inference error: ${msg.text()}`);
+                        break;
+                    }
+                }
+            }
+        };
+        this.page.on('console', consoleErrorListener);
+
         // Click send button to submit the prompt
         await sendBtn.click();
         console.log("Clicked Send button, waiting for response...");
@@ -770,6 +791,10 @@ class ModelRunner extends WebNNRunner {
         let perfText = '';
         let checks = 0;
         while(checks < 600) { // 5 mins max
+            // Fail fast if we detected an EP/inference error
+            if (epError) {
+                throw new Error(`Inference failed (EP error): ${epError}`);
+            }
             perfText = await perfIndicator.innerText().catch(() => '');
             if (perfText && /\d/.test(perfText) && (perfText.includes('token') || perfText.includes('s'))) {
                  break;
@@ -778,6 +803,10 @@ class ModelRunner extends WebNNRunner {
             checks++;
         }
 
+        // Clean up listener
+        try { this.page.removeListener('console', consoleErrorListener); } catch(e) {}
+
+        if (epError) throw new Error(`Inference failed (EP error): ${epError}`);
         if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
 
         console.log(`Performance result: ${perfText}`);
@@ -857,6 +886,45 @@ class ModelRunner extends WebNNRunner {
     } catch(e) { throw e; }
   }
 
+  /**
+   * Generate a minimal WAV file buffer containing a short sine wave tone.
+   * This avoids needing microphone permissions for the Whisper test.
+   * @param {number} durationSec - Duration in seconds
+   * @param {number} sampleRate - Sample rate (Whisper expects 16kHz)
+   * @param {number} frequency - Tone frequency in Hz
+   * @returns {Buffer} WAV file as a Node.js Buffer
+   */
+  _generateTestWav(durationSec = 2, sampleRate = 16000, frequency = 440) {
+      const numSamples = sampleRate * durationSec;
+      const bytesPerSample = 2; // 16-bit PCM
+      const dataSize = numSamples * bytesPerSample;
+      const buffer = Buffer.alloc(44 + dataSize); // 44 = WAV header size
+
+      // WAV header
+      buffer.write('RIFF', 0);
+      buffer.writeUInt32LE(36 + dataSize, 4);      // file size - 8
+      buffer.write('WAVE', 8);
+      buffer.write('fmt ', 12);
+      buffer.writeUInt32LE(16, 16);                  // fmt chunk size
+      buffer.writeUInt16LE(1, 20);                   // PCM format
+      buffer.writeUInt16LE(1, 22);                   // mono
+      buffer.writeUInt32LE(sampleRate, 24);           // sample rate
+      buffer.writeUInt32LE(sampleRate * bytesPerSample, 28); // byte rate
+      buffer.writeUInt16LE(bytesPerSample, 32);      // block align
+      buffer.writeUInt16LE(16, 34);                  // bits per sample
+      buffer.write('data', 36);
+      buffer.writeUInt32LE(dataSize, 40);             // data chunk size
+
+      // Write sine wave samples (16-bit signed PCM)
+      for (let i = 0; i < numSamples; i++) {
+          const sample = Math.sin(2 * Math.PI * frequency * i / sampleRate);
+          const intSample = Math.max(-32768, Math.min(32767, Math.round(sample * 32767 * 0.5))); // 50% volume
+          buffer.writeInt16LE(intSample, 44 + i * bytesPerSample);
+      }
+
+      return buffer;
+  }
+
   async runModelWhisper(results, modelDef) {
       const testName = modelDef.name;
       const device = process.env.DEVICE || 'cpu';
@@ -873,36 +941,36 @@ class ModelRunner extends WebNNRunner {
           await this.page.waitForLoadState('domcontentloaded');
 
           // The whisper-base demo auto-loads the model on page init (no Load button).
-          // When the model is ready, the record (#record), speech (#speech), and
-          // file-upload (#file-upload) controls become enabled.
-          const recordBtn = this.page.locator('#record');
+          // When the model is ready, controls like #file-upload become enabled.
+          const fileUpload = this.page.locator('#file-upload');
 
-          console.log("Waiting for model to load (#record button to become enabled)...");
-          await recordBtn.waitFor({ state: 'visible', timeout: 300000 });
-          // Poll for the button to become enabled (disabled attr removed)
+          console.log("Waiting for model to load (#file-upload to become enabled)...");
+          await fileUpload.waitFor({ state: 'attached', timeout: 300000 });
+          // Poll for the input to become enabled
           let modelReady = false;
           for (let i = 0; i < 600; i++) { // up to 5 min
-              const isDisabled = await recordBtn.isDisabled();
+              const isDisabled = await fileUpload.isDisabled();
               if (!isDisabled) { modelReady = true; break; }
               await this.page.waitForTimeout(500);
           }
-          if (!modelReady) throw new Error("Whisper model failed to load (record button stayed disabled)");
+          if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
           console.log("Model loaded. Controls are enabled.");
 
-          // Use the record button to capture a short audio clip.
-          // Click to start recording, wait briefly, click again to stop.
-          // After stop, the demo auto-transcribes the recorded audio.
-          console.log("Starting recording...");
-          await recordBtn.click();
-          await this.page.waitForTimeout(3000); // Record ~3 seconds of ambient audio
-          console.log("Stopping recording...");
-          await recordBtn.click();
+          // Generate a short test WAV file (2 second 440Hz tone) and upload it.
+          // This avoids needing microphone permissions.
+          const wavBuffer = this._generateTestWav(2, 16000, 440);
+          const tempWavPath = path.join(os.tmpdir(), `webnn-test-tone-${Date.now()}.wav`);
+          fs.writeFileSync(tempWavPath, wavBuffer);
+          console.log(`Generated test WAV file: ${tempWavPath} (${wavBuffer.length} bytes)`);
+
+          // Upload via the file input
+          await fileUpload.setInputFiles(tempWavPath);
+          console.log("Uploaded WAV file. Waiting for transcription...");
 
           // Wait for transcription output in #outputText
           const outputText = this.page.locator('#outputText');
           const latencyEl = this.page.locator('#latency');
 
-          console.log("Waiting for transcription to complete...");
           let latencyText = '';
           let checks = 0;
           while(checks < 120) { // up to 60 seconds
@@ -919,8 +987,10 @@ class ModelRunner extends WebNNRunner {
           console.log(`Transcription result: "${transcription}"`);
           console.log(`Latency info: ${latencyText}`);
 
+          // Clean up temp file
+          try { fs.unlinkSync(tempWavPath); } catch(e) {}
+
           // Consider it a pass if the transcription completed (latency hit 100%)
-          // Even silence/ambient noise will produce some output or blank audio tags
           if (!latencyText || !latencyText.includes('100')) {
               throw new Error("Transcription did not complete (latency never reached 100%)");
           }
@@ -929,7 +999,7 @@ class ModelRunner extends WebNNRunner {
               testName: testName,
               testUrl: testUrl,
               result: 'PASS',
-              details: `Transcription: ${transcription || '(silence/blank)'}. ${latencyText}`,
+              details: `Transcription: ${transcription || '(tone/blank)'}. ${latencyText}`,
               subcases: { total: 1, passed: 1, failed: 0 },
               suite: 'model'
           });
