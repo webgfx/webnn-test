@@ -599,9 +599,10 @@ Examples:
                                    }
                                }
 
-                               // Compare
+                               // Compare (baseline applies to WPT suite only)
                                let matchCount = 0;
                                results.forEach(r => {
+                                   if (r.fullConfig && r.fullConfig.suite !== 'wpt') return;
                                    // Construct key matching how text report generates it
                                    // key = `${r.framework}-${r.backend}-${r.deviceName}`
                                    const key = `${r.framework}-${r.backend}-${r.deviceName}`;
