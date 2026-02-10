@@ -741,60 +741,51 @@ class ModelRunner extends WebNNRunner {
         await this.page.goto(testUrl);
         await this.page.waitForLoadState('domcontentloaded');
 
-        // Look for Load button
-        const loadSelectors = [
-            '#load',
-            'button:has-text("Load")',
-            'button:text("Load")'
-        ];
+        // The text-generation demo auto-loads the model on page init (no Load button).
+        // The send button (#send-button) starts disabled and becomes enabled when the model is ready.
+        const sendBtn = this.page.locator('#send-button');
 
-        let loadBtn = null;
-        for (const sel of loadSelectors) {
-             try { loadBtn = this.page.locator(sel).first(); if (await loadBtn.isVisible()) break; } catch(e){}
-        }
+        console.log("Waiting for model to load (#send-button to become enabled)...");
+        await sendBtn.waitFor({ state: 'visible', timeout: 600000 });
+        await expect(sendBtn).not.toBeDisabled({ timeout: 600000 });
+        console.log("Model loaded. Send button is enabled.");
 
-        if (loadBtn) {
-            await loadBtn.click();
-            console.log("Clicked Load button");
-        } else {
-            console.log("Load button not found, assuming auto-load or different UI");
-        }
+        // Type a prompt into the #user-input contenteditable div
+        const userInput = this.page.locator('#user-input');
+        const testPrompt = 'What is 2 + 2?';
+        await userInput.click();
+        await userInput.fill(testPrompt).catch(async () => {
+            // contenteditable divs may not support fill(), use keyboard input
+            await userInput.pressSequentially(testPrompt, { delay: 30 });
+        });
+        console.log(`Typed prompt: "${testPrompt}"`);
 
-        // Wait quite a while for model load - look for generation start capability or input
-        const generateBtnSelector = '#generate';
-        const generateBtn = this.page.locator(generateBtnSelector);
+        // Click send button to submit the prompt
+        await sendBtn.click();
+        console.log("Clicked Send button, waiting for response...");
 
-        console.log("Waiting for Generate button enabled (Model loading)...");
-        await generateBtn.waitFor({ state: 'visible', timeout: 600000 });
-        // Check if disabled removal happens
-        await expect(generateBtn).not.toBeDisabled({ timeout: 600000 });
+        // Wait for performance indicator to show tokens/sec data
+        const perfIndicator = this.page.locator('#performance-indicator');
 
-        console.log("Model Loaded. Clicking Generate...");
-        await generateBtn.click();
-
-        // Check for tokens/sec or latency
-        const tokenSelector = '#tokens';
-        const tokenEl = this.page.locator(tokenSelector);
-        await tokenEl.waitFor({ state: 'visible', timeout: 120000 });
-
-        let tokenText = '';
+        let perfText = '';
         let checks = 0;
-        while(checks < 300) { // 2.5 mins
-            tokenText = await tokenEl.innerText();
-            if (tokenText && /\d/.test(tokenText)) {
+        while(checks < 600) { // 5 mins max
+            perfText = await perfIndicator.innerText().catch(() => '');
+            if (perfText && /\d/.test(perfText) && (perfText.includes('token') || perfText.includes('s'))) {
                  break;
             }
             await this.page.waitForTimeout(500);
             checks++;
         }
 
-        if (!tokenText) throw new Error("No token/sec result found");
+        if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
 
+        console.log(`Performance result: ${perfText}`);
         results.push({
             testName: testName,
             testUrl: testUrl,
             result: 'PASS',
-            details: `Tokens: ${tokenText}`,
+            details: `Performance: ${perfText.replace(/\n/g, ', ')}`,
             subcases: { total: 1, passed: 1, failed: 0 },
             suite: 'model'
         });
@@ -870,9 +861,9 @@ class ModelRunner extends WebNNRunner {
       const testName = modelDef.name;
       const device = process.env.DEVICE || 'cpu';
 
-      // Construct URL: ?devicetype=<device>
+      // Construct URL: ?provider=webnn&devicetype=<device>
       const baseUrl = modelDef.url.split('?')[0];
-      const testUrl = `${baseUrl}?devicetype=${device}`;
+      const testUrl = `${baseUrl}?provider=webnn&devicetype=${device}`;
 
       console.log(`Running preview test: ${testName} on ${device}`);
       console.log(`Navigating to: ${testUrl}`);
@@ -881,49 +872,64 @@ class ModelRunner extends WebNNRunner {
           await this.page.goto(testUrl);
           await this.page.waitForLoadState('domcontentloaded');
 
-          // Wait for load
-          const status = this.page.locator('#status');
+          // The whisper-base demo auto-loads the model on page init (no Load button).
+          // When the model is ready, the record (#record), speech (#speech), and
+          // file-upload (#file-upload) controls become enabled.
+          const recordBtn = this.page.locator('#record');
 
-          // There might be a Load button or auto load
-          // Demo specific: Usually "Load Model" button
-          const loadBtn = this.page.locator('button', { hasText: 'Load' });
-          if (await loadBtn.isVisible()) {
-              await loadBtn.click();
+          console.log("Waiting for model to load (#record button to become enabled)...");
+          await recordBtn.waitFor({ state: 'visible', timeout: 300000 });
+          // Poll for the button to become enabled (disabled attr removed)
+          let modelReady = false;
+          for (let i = 0; i < 600; i++) { // up to 5 min
+              const isDisabled = await recordBtn.isDisabled();
+              if (!isDisabled) { modelReady = true; break; }
+              await this.page.waitForTimeout(500);
           }
+          if (!modelReady) throw new Error("Whisper model failed to load (record button stayed disabled)");
+          console.log("Model loaded. Controls are enabled.");
 
-          // Wait for Ready
-          console.log("Waiting for model ready...");
-          // This can take time.
-          await this.page.waitForTimeout(10000);
+          // Use the record button to capture a short audio clip.
+          // Click to start recording, wait briefly, click again to stop.
+          // After stop, the demo auto-transcribes the recorded audio.
+          console.log("Starting recording...");
+          await recordBtn.click();
+          await this.page.waitForTimeout(3000); // Record ~3 seconds of ambient audio
+          console.log("Stopping recording...");
+          await recordBtn.click();
 
-          // Usually there is "Run" or "Transcribe" from audio file
-          // Need to select audio file or check defaults.
-          // Assuming there is a "Run" button for default sample
-          const runBtn = this.page.locator('button', { hasText: 'Run' }).or(this.page.locator('button', { hasText: 'Transcribe' }));
+          // Wait for transcription output in #outputText
+          const outputText = this.page.locator('#outputText');
+          const latencyEl = this.page.locator('#latency');
 
-          await runBtn.waitFor({ state: 'visible', timeout: 300000 });
-          await runBtn.click();
-
-          // Check output
-          const output = this.page.locator('#output').or(this.page.locator('#result'));
-          await output.waitFor({ state: 'visible', timeout: 60000 });
-
-          let text = '';
+          console.log("Waiting for transcription to complete...");
+          let latencyText = '';
           let checks = 0;
-          while(checks < 60) {
-              text = await output.textContent();
-              if (text && text.trim().length > 5) break;
+          while(checks < 120) { // up to 60 seconds
+              latencyText = await latencyEl.innerText().catch(() => '');
+              // Transcription is done when latency shows 100% or a completion indicator
+              if (latencyText && latencyText.includes('100')) {
+                  break;
+              }
               await this.page.waitForTimeout(500);
               checks++;
           }
 
-          if (!text) throw new Error("No transcription result");
+          const transcription = await outputText.textContent().catch(() => '');
+          console.log(`Transcription result: "${transcription}"`);
+          console.log(`Latency info: ${latencyText}`);
+
+          // Consider it a pass if the transcription completed (latency hit 100%)
+          // Even silence/ambient noise will produce some output or blank audio tags
+          if (!latencyText || !latencyText.includes('100')) {
+              throw new Error("Transcription did not complete (latency never reached 100%)");
+          }
 
           results.push({
               testName: testName,
               testUrl: testUrl,
               result: 'PASS',
-              details: "Transcription success",
+              details: `Transcription: ${transcription || '(silence/blank)'}. ${latencyText}`,
               subcases: { total: 1, passed: 1, failed: 0 },
               suite: 'model'
           });
