@@ -177,6 +177,21 @@ By default, failed WPT test cases are retried automatically. Use `--skip-retry` 
 node src/main.js --suite wpt --skip-retry
 ```
 
+## Email Report
+
+Send test results via email after completion using `--email`:
+
+```bash
+# Send to default address
+node src/main.js --suite wpt --email
+
+# Send to a specific address
+node src/main.js --suite wpt --email user@example.com
+```
+
+> **Note:** The email feature requires **Classic Outlook** to be installed on the machine. The new Outlook app does not support COM automation. If `--email` fails, install Classic Outlook from:
+> https://support.microsoft.com/en-us/office/install-or-reinstall-classic-outlook-on-a-windows-pc-5c94902b-31a5-4274-abb0-b07f4661edf5
+
 ## Baseline Comparison
 
 Test results can be compared against a previous run (baseline) to detect regressions and improvements at both the case level and subcase level. By default, the most recent results directory containing a text report is used as the baseline.
