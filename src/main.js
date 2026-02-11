@@ -360,6 +360,7 @@ Examples:
               // Store DLL results per configuration
               // Structure: { configName: string, framework: string, backend: string, device: string, results: object }
               let allDllResults = [];
+              let browserInfo = null; // { name, channel, version }
 
               for (const [idx, config] of configs.entries()) {
                    // Pre-flight check: Skip if NPU/GPU device requested but not found
@@ -388,6 +389,36 @@ Examples:
                    browser = instance.browser || instance.context;
                    context = instance.context;
                    page = instance.page;
+
+                   // Capture browser info on first launch
+                   if (!browserInfo) {
+                       try {
+                           const channel = process.env.CHROME_CHANNEL || 'chrome-canary';
+                           let name = 'Chrome';
+                           if (channel.includes('edge')) name = 'Edge';
+
+                           // Get full version via CDP (Browser.getVersion returns the real version)
+                           let version = 'Unknown';
+                           try {
+                               const cdp = await page.context().newCDPSession(page);
+                               const info = await cdp.send('Browser.getVersion');
+                               // info.product is like "Chrome/146.0.7680.2"
+                               const m = info.product && info.product.match(/\/([\d.]+)/);
+                               if (m) version = m[1];
+                               await cdp.detach();
+                           } catch (_) {}
+
+                           const channelLabel = channel.replace('chrome-', '').replace('chrome', 'stable');
+                           browserInfo = {
+                               name: name,
+                               channel: channelLabel.charAt(0).toUpperCase() + channelLabel.slice(1),
+                               version: version
+                           };
+                           console.log(`[Browser] ${browserInfo.name} ${browserInfo.channel} v${browserInfo.version}`);
+                       } catch (e) {
+                           console.log('[Warning] Could not retrieve browser info:', e.message);
+                       }
+                   }
 
                    let currentRunner;
                    if (config.suite === 'wpt') {
@@ -623,7 +654,7 @@ Examples:
                    }
                    // -----------------------------------
 
-                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, allDllResults, wallTime, sumOfTestTimes, baselineDirName);
+                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, allDllResults, wallTime, sumOfTestTimes, baselineDirName, browserInfo);
 
                    const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');
                    const timestamp = process.env.PROJECT_TIMESTAMP;
@@ -641,6 +672,9 @@ Examples:
 
                        // Header with System Info
                        let sysInfoText = '=== System Information ===\n';
+                       if (browserInfo) {
+                           sysInfoText += `Browser: ${browserInfo.name} ${browserInfo.channel} ${browserInfo.version}\n`;
+                       }
                        if (sysCpuInfo) sysInfoText += `CPU: ${sysCpuInfo}\n`;
                        if (sysGpuInfo) {
                            sysInfoText += `GPU: ${sysGpuInfo.name || 'Unknown'}\n`;

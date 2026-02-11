@@ -712,7 +712,7 @@ class WebNNRunner {
     });
   }
 
-  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null, wallTime = null, sumOfTestTimes = null, baselineDirName = null) {
+  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null, wallTime = null, sumOfTestTimes = null, baselineDirName = null, browserInfo = null) {
     const totalSubcases = results.reduce((sum, r) => sum + r.subcases.total, 0);
     const passedSubcases = results.reduce((sum, r) => sum + r.subcases.passed, 0);
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
@@ -784,6 +784,22 @@ class WebNNRunner {
 
     // Device Info (CPU, GPU, NPU)
     let deviceInfoHtml = '';
+
+    // Browser Info
+    if (browserInfo) {
+        deviceInfoHtml += `
+        <div style="background-color: #fff3e0; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #ffcc80;">
+            <h3 style="margin-top: 0; color: #e65100;">Browser Information</h3>
+            <div style="display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center;">
+                <div style="font-weight: bold; color: #bf360c;">Name:</div>
+                <div>${browserInfo.name}</div>
+                <div style="font-weight: bold; color: #bf360c;">Channel:</div>
+                <div>${browserInfo.channel}</div>
+                <div style="font-weight: bold; color: #bf360c;">Version:</div>
+                <div>${browserInfo.version}</div>
+            </div>
+        </div>`;
+    }
 
     // CPU Info (if any test ran on cpu)
     const hasCpuTest = results.some(r => r.device === 'cpu');
