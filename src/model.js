@@ -846,16 +846,24 @@ class ModelRunner extends WebNNRunner {
         await this.page.goto(testUrl);
         await this.page.waitForLoadState('domcontentloaded');
 
-        // This demo usually requires user interaction (clicking image).
-        // Automated version might just check if model loads.
-        // Assuming there is some indicator or we try to canvas click.
+        // The canvas starts hidden (class="none") and only becomes visible
+        // after both SAM models (~187MB total) are downloaded and compiled.
+        // Use a generous timeout to account for model loading time.
+        console.log("Waiting for canvas (model loading may take a while)...");
+        const canvas = this.page.locator('#img_canvas');
+        await canvas.waitFor({ state: 'visible', timeout: 300000 });
 
-        console.log("Waiting for canvas...");
-        const canvas = this.page.locator('canvas').first();
-        await canvas.waitFor({ state: 'visible', timeout: 60000 });
-
-        // Wait for potential loading indicators to disappear
-        await this.page.waitForTimeout(5000);
+        // After canvas is visible, the default image (EgyptianCat.png) is
+        // processed by the encoder via handleImage(). Wait for the cursor
+        // to change from "wait" to "default" indicating the encoder is done.
+        console.log("Waiting for encoder to finish processing default image...");
+        let encoderReady = false;
+        for (let i = 0; i < 600; i++) { // up to 5 min
+            const cursor = await canvas.evaluate(el => el.style.cursor);
+            if (cursor !== 'wait') { encoderReady = true; break; }
+            await this.page.waitForTimeout(500);
+        }
+        if (!encoderReady) throw new Error("Encoder did not finish processing the image in time");
 
         console.log("Clicking on canvas to trigger segmentation...");
         const box = await canvas.boundingBox();
@@ -865,29 +873,26 @@ class ModelRunner extends WebNNRunner {
             throw new Error("Canvas bounding box not found");
         }
 
-        // Check for latency indicator
-        const latencySel = '#latency';
-        const latEl = this.page.locator(latencySel);
+        // The actual latency element ID is "decoder_latency", not "latency"
+        const latEl = this.page.locator('#decoder_latency');
 
-        // It might take time for first inference
-        await latEl.waitFor({ state: 'visible', timeout: 30000 });
-
+        // Poll for a numeric latency value to appear
         let latText = '';
         let checks = 0;
-        while(checks < 60) {
-            latText = await latEl.innerText();
-            if (latText && /\d/.test(latText) && !latText.includes('...')) break;
+        while(checks < 120) { // up to 60 seconds
+            latText = await latEl.innerText().catch(() => '');
+            if (latText && /\d/.test(latText)) break;
             await this.page.waitForTimeout(500);
             checks++;
         }
 
-        if (!latText) throw new Error("Latency not displayed");
+        if (!latText) throw new Error("Decoder latency not displayed");
 
         results.push({
             testName: testName,
             testUrl: testUrl,
             result: 'PASS',
-            details: `Latency: ${latText}`,
+            details: `Decoder Latency: ${latText}ms`,
             subcases: { total: 1, passed: 1, failed: 0 },
             suite: 'model'
         });
