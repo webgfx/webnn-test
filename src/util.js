@@ -5,6 +5,44 @@ const fs = require('fs');
 const os = require('os');
 const { chromium } = require('@playwright/test');
 
+// Kill only browser processes that belong to our automation.
+// Uses the browser root PID (captured at launch) to kill the entire process tree,
+// without affecting the user's personal browser windows.
+function killOwnBrowserProcesses(browserRootPid) {
+    if (!browserRootPid) {
+        console.log('[Warning] No browser PID tracked, skipping targeted cleanup');
+        return 0;
+    }
+    try {
+        execSync(`taskkill /F /T /PID ${browserRootPid}`, { stdio: 'ignore', timeout: 10000 });
+        console.log(`[Info] Killed browser process tree (root PID: ${browserRootPid})`);
+        return 1;
+    } catch (e) {
+        // Process may already be dead
+        return 0;
+    }
+}
+
+// Find the browser root PID by looking for an msedge/chrome process whose parent
+// is the current Node process (i.e., Playwright spawned it).
+function findBrowserRootPid(processName = 'msedge.exe') {
+    try {
+        const tempScript = path.join(os.tmpdir(), `find-browser-${Date.now()}.ps1`);
+        fs.writeFileSync(tempScript,
+            `Get-CimInstance Win32_Process -Filter "Name='${processName}'" | ` +
+            `Where-Object { $_.ParentProcessId -eq ${process.pid} } | ` +
+            `Select-Object -ExpandProperty ProcessId`, 'utf8');
+        const output = execSync(`powershell -ExecutionPolicy Bypass -File "${tempScript}"`, {
+            encoding: 'utf8', timeout: 10000
+        }).trim();
+        try { fs.unlinkSync(tempScript); } catch (e) {}
+        if (output) {
+            const pid = parseInt(output.split('\n')[0].trim(), 10);
+            if (!isNaN(pid)) return pid;
+        }
+    } catch (e) { /* best effort */ }
+    return null;
+}
 
 async function send_email(subject, content, sender = '', to = '') {
     // Create PowerShell script to send email via Outlook
@@ -148,7 +186,7 @@ ${content}
     if (os.platform() === 'win32') {
         try {
             const cmd = 'powershell -c "Get-CimInstance -query \'select * from win32_VideoController\' | Select-Object Name, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}}, DriverVersion, PNPDeviceID, Status | ConvertTo-Json -Compress"';
-            const output = execSync(cmd, { encoding: 'utf8' }).trim();
+            const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
 
             if (output) {
                 let gpus = [];
@@ -225,7 +263,7 @@ ${content}
     try {
         if (os.platform() === 'win32') {
              const cmd = 'powershell -c "Get-CimInstance -ClassName Win32_Processor | Select-Object -ExpandProperty Name"';
-             const cpuName = execSync(cmd, { encoding: 'utf8' }).trim();
+             const cpuName = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
              return cpuName;
         } else {
              const cpus = os.cpus();
@@ -250,7 +288,7 @@ ${content}
             // Common potential names: "Intel(R) AI Boost", "LNP", "NPU"
             // We use word boundary \bNPU\b to avoid matching "Input" (which contains "npu")
             const cmd = 'powershell -c "Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match \'\\\\bNPU\\\\b|AI Boost|Hexagon|Movidius\' } | Sort-Object -Property DriverDate -Descending | Select-Object DeviceName, DriverVersion, DeviceID, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}} | ConvertTo-Json -Compress"';
-            const output = execSync(cmd, { encoding: 'utf8' }).trim();
+            const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
             if (output) {
                 let npu = null;
                 try {
@@ -371,6 +409,7 @@ class WebNNRunner {
     this.page = page;
     this.epFlag = process.env.EP_FLAG === 'true';
     this.launchNewBrowser = null;
+    this.browserRootPid = null;
   }
 
   // Ensure the page is available, recreating it if necessary
@@ -387,13 +426,17 @@ class WebNNRunner {
     }
   }
 
-  // Wrapper for running a test with session failure monitoring
-  async runTestWithSessionCheck(testFn, shouldRestart = true) {
+  // Wrapper for running a test with session failure monitoring.
+  // Includes a hard timeout (default 10 min) that fires even when the GPU process
+  // crashes and Playwright calls hang forever at the IPC level.
+  async runTestWithSessionCheck(testFn, shouldRestart = true, { timeoutMs = 600000 } = {}) {
     await this.ensurePage();
     const pageInUse = this.page;
 
     let sessionInitFailed = false;
     let sessionFailureMessage = '';
+    let browserCrashed = false;
+    let hardTimedOut = false;
 
     const checkFailure = async (text) => {
       if (text.toLowerCase().includes('failed to create session')) {
@@ -425,29 +468,64 @@ class WebNNRunner {
     pageInUse.on('console', failConsoleListener);
     pageInUse.on('pageerror', failErrorListener);
 
+    // Hard timeout: when the GPU process crashes, the renderer's IPC channel
+    // hangs and ALL Playwright calls (evaluate, isDisabled, goto, etc.) block
+    // forever. Promise.race with a timer ensures we abort and recover.
+    let hardTimer;
+    const hardTimeoutPromise = new Promise((_, reject) => {
+      hardTimer = setTimeout(() => {
+        hardTimedOut = true;
+        reject(new Error(`Test hard timeout (${timeoutMs/1000}s) - GPU process may have crashed`));
+      }, timeoutMs);
+    });
+
     try {
-      await testFn();
+      await Promise.race([testFn(), hardTimeoutPromise]);
+      clearTimeout(hardTimer);
       // Check if session failed even if testFn swallowed the error (e.g. via internal try/catch)
       if (sessionInitFailed) {
         throw new Error(`Failed to create session: ${sessionFailureMessage}`);
       }
     } catch (error) {
-      if (sessionInitFailed) {
-        console.log('[Info] Handling session failure recovery...');
+      clearTimeout(hardTimer);
+      // Detect GPU process crash: the browser/page dies mid-test, producing
+      // errors like "Target page, context or browser has been closed" or
+      // "Target closed" or "Protocol error ... Target closed".
+      const msg = error.message || '';
+      const isCrash = hardTimedOut ||
+                      msg.includes('Target page, context or browser has been closed') ||
+                      msg.includes('Target closed') ||
+                      msg.includes('browser has been closed') ||
+                      msg.includes('Protocol error') ||
+                      msg.includes('Connection closed');
+      if (isCrash && !sessionInitFailed) {
+        browserCrashed = true;
+        console.error(`[Fail] [Browser Crash] Browser process died during test. Error: ${msg}`);
+      }
+
+      if (sessionInitFailed || browserCrashed) {
+        console.log('[Info] Handling browser failure recovery...');
         if (shouldRestart) {
           try {
-              const currentContext = pageInUse.context();
-              const objectToClose = currentContext.browser() || currentContext;
+              let objectToClose = null;
+              try {
+                const currentContext = pageInUse.context();
+                objectToClose = currentContext.browser() || currentContext;
+              } catch (e) { /* context may already be dead */ }
               const instance = await this.restartBrowserAndContext(objectToClose);
               this.page = instance.page;
           } catch (restartError) {
               console.error(`[Error] Failed to restart browser: ${restartError.message}`);
           }
         }
-        throw new Error(`Failed to create session: ${sessionFailureMessage}`);
+        if (sessionInitFailed) {
+          throw new Error(`Failed to create session: ${sessionFailureMessage}`);
+        }
+        throw new Error(`Browser crashed: ${msg}`);
       }
       throw error;
     } finally {
+      clearTimeout(hardTimer);
       try {
         if (!pageInUse.isClosed()) {
             pageInUse.removeListener('console', failConsoleListener);
@@ -483,14 +561,11 @@ class WebNNRunner {
       }
     }
 
-    // Force kill browser process to ensure clean restart (resolves "Failed to launch persistent context" issues)
-    try {
-        const channel = process.env.CHROME_CHANNEL || 'chrome';
-        const processName = channel.includes('edge') ? 'msedge.exe' : 'chrome.exe';
-        console.log(`[Info] Ensuring process ${processName} is terminated (taskkill)...`);
-        execSync(`taskkill /F /IM ${processName}`, { stdio: 'ignore' });
-    } catch (e) {
-        // Process might not exist, which is fine
+    // Force kill our browser process tree to ensure clean restart
+    if (this.browserRootPid) {
+        console.log(`[Info] Killing browser process tree (PID: ${this.browserRootPid})...`);
+        killOwnBrowserProcesses(this.browserRootPid);
+        this.browserRootPid = null;
     }
 
     // Wait a bit to ensure process is fully gone
@@ -719,6 +794,7 @@ class WebNNRunner {
     const passed = results.filter(r => r.result === 'PASS').length;
     const failed = results.filter(r => r.result === 'FAIL').length;
     const errors = results.filter(r => r.result === 'ERROR').length;
+    const skipped = results.filter(r => r.result === 'SKIP').length;
 
     // Calculate overall regressions and improvements (case-level and subcase-level)
     const allRegressions = [];
@@ -1133,6 +1209,7 @@ class WebNNRunner {
             const groupPassed = groupResults.filter(r => r.result === 'PASS').length;
             const groupFailed = groupResults.filter(r => r.result === 'FAIL').length;
             const groupErrors = groupResults.filter(r => r.result === 'ERROR').length;
+            const groupSkipped = groupResults.filter(r => r.result === 'SKIP').length;
             const groupTotalSubcases = groupResults.reduce((s,r)=>s+r.subcases.total,0);
             const groupPassedSubcases = groupResults.reduce((s,r)=>s+r.subcases.passed,0);
             const groupFailedSubcases = groupResults.reduce((s,r)=>s+r.subcases.failed,0);
@@ -1180,6 +1257,7 @@ class WebNNRunner {
                  <div style="font-weight: bold; color: #28a745;">Pass: ${groupPassed}</div>
                  <div style="font-weight: bold; color: #dc3545;">Fail: ${groupFailed}</div>
                  ${groupErrors > 0 ? `<div style="font-weight: bold; color: #fd7e14;">Error: ${groupErrors}</div>` : ''}
+                 ${groupSkipped > 0 ? `<div style="font-weight: bold; color: #6c757d;">Skip: ${groupSkipped}</div>` : ''}
                  <div style="width: 1px; background-color: #e1e4e8; margin: 0 5px;"></div>
 
                  ${groupRegressions > 0 ? `<div style="font-weight: bold; color: #dc3545;">Regressions: ${groupRegressions}</div>` : ''}
@@ -1256,7 +1334,7 @@ class WebNNRunner {
                         ${groupResults.map(result => {
                           const retryCount = result.retryHistory ? result.retryHistory.length - 1 : 0;
                           const retryInfo = retryCount > 0 ? `${retryCount} retry(ies)` : 'No retries';
-                          const statusColor = result.result === 'PASS' ? '#28a745' : result.result === 'FAIL' ? '#dc3545' : '#fd7e14';
+                          const statusColor = result.result === 'PASS' ? '#28a745' : result.result === 'FAIL' ? '#dc3545' : result.result === 'SKIP' ? '#6c757d' : '#fd7e14';
                           const statusStyle = `color: ${statusColor}; font-weight: bold;`;
                           const baseTdStyle = "border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left;";
 
@@ -1360,6 +1438,44 @@ class WebNNRunner {
                                 <td style="${baseTdStyle} font-size: 12px; color: #586069;">${retryInfo}</td>
                                 <td style="${baseTdStyle}"><strong>${result.executionTime ? result.executionTime + 's' : 'N/A'}</strong></td>
                             </tr>
+                            ${result.perfMetrics && Object.keys(result.perfMetrics).length > 0 ? `
+                            <tr style="background-color: #f0f7ff;">
+                                <td colspan="10" style="border: 1px solid #e1e4e8; padding: 4px 12px 8px 24px; font-size: 12px;">
+                                    <details>
+                                        <summary style="cursor: pointer; color: #0366d6; font-weight: 600;">WebNN Perf Metrics</summary>
+                                        <table style="margin-top: 6px; border-collapse: collapse; font-size: 12px; width: auto;">
+                                            <thead><tr>
+                                                <th style="border: 1px solid #ddd; padding: 4px 8px; background: #f6f8fa; text-align: left;">Phase</th>
+                                                <th style="border: 1px solid #ddd; padding: 4px 8px; background: #f6f8fa; text-align: right;">Duration (ms)</th>
+                                                <th style="border: 1px solid #ddd; padding: 4px 8px; background: #f6f8fa; text-align: left;">Notes</th>
+                                            </tr></thead>
+                                            <tbody>${(() => {
+                                                const pm = result.perfMetrics;
+                                                let rows = '';
+                                                for (const [phase, data] of Object.entries(pm)) {
+                                                    if (Array.isArray(data)) {
+                                                        const durations = data.map(d => d.durationMs).filter(d => typeof d === 'number');
+                                                        const avg = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length).toFixed(1) : 'N/A';
+                                                        const models = [...new Set(data.map(d => d.model).filter(Boolean))];
+                                                        const notes = durations.length + ' calls, avg ' + avg + 'ms' + (models.length > 0 ? ' (' + models.join(', ') + ')' : '');
+                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + phase + '</td>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;text-align:right;">' + avg + '</td>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + notes + '</td></tr>';
+                                                    } else {
+                                                        const dur = typeof data.durationMs === 'number' ? data.durationMs.toFixed(1) : 'N/A';
+                                                        const notes = data.model ? data.model : '';
+                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + phase + '</td>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;text-align:right;">' + dur + '</td>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + notes + '</td></tr>';
+                                                    }
+                                                }
+                                                return rows;
+                                            })()}</tbody>
+                                        </table>
+                                    </details>
+                                </td>
+                            </tr>
+                            ` : ''}
                           `;
                         }).join('')}
                         <tr style="background-color: #e8f5e9; font-weight: bold;">
@@ -1549,4 +1665,154 @@ class WebNNRunner {
   }
 }
 
-module.exports = { WebNNRunner, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
+/**
+ * Captures structured [WebNN:Perf] console events emitted by the
+ * webnn-perf.js instrumentation in the developer-preview demos.
+ *
+ * Usage:
+ *   const collector = new WebNNPerfCollector();
+ *   collector.start(page);
+ *   // ... run demo ...
+ *   const metrics = collector.getSummary();
+ *   collector.stop();
+ */
+class WebNNPerfCollector {
+  constructor() {
+    this._entries = [];
+    this._page = null;
+    this._listener = null;
+    this._waiters = [];
+  }
+
+  start(page) {
+    this._page = page;
+    this._entries = [];
+    this._waiters = [];
+
+    this._listener = (msg) => {
+      const text = msg.text();
+      if (!text.startsWith('[WebNN:Perf] ')) return;
+      try {
+        const json = JSON.parse(text.slice('[WebNN:Perf] '.length));
+        this._entries.push({ ...json, _timestamp: Date.now() });
+        // Resolve any waiters matching this event name
+        this._waiters = this._waiters.filter(w => {
+          if (w.name === json.name) {
+            w.resolve(json);
+            return false;
+          }
+          return true;
+        });
+      } catch (e) {
+        // Malformed payload — ignore
+      }
+    };
+
+    page.on('console', this._listener);
+  }
+
+  stop() {
+    if (this._page && this._listener) {
+      try {
+        if (!this._page.isClosed()) {
+          this._page.removeListener('console', this._listener);
+        }
+      } catch (e) { /* page may already be closed */ }
+    }
+    // Reject pending waiters
+    this._waiters.forEach(w => w.reject(new Error('WebNNPerfCollector stopped')));
+    this._waiters = [];
+    this._listener = null;
+  }
+
+  getEntries() {
+    return [...this._entries];
+  }
+
+  /**
+   * Returns a promise that resolves when an event with the given name arrives.
+   * Resolves immediately if such an event was already captured.
+   */
+  waitForEvent(name, { timeout = 60000 } = {}) {
+    const existing = this._entries.find(e => e.name === name);
+    if (existing) return Promise.resolve(existing);
+
+    return new Promise((resolve, reject) => {
+      const waiter = { name, resolve, reject };
+      this._waiters.push(waiter);
+
+      const timer = setTimeout(() => {
+        this._waiters = this._waiters.filter(w => w !== waiter);
+        reject(new Error(`WebNNPerfCollector: timeout waiting for "${name}"`));
+      }, timeout);
+
+      // Wrap resolve to clear timer
+      const origResolve = waiter.resolve;
+      waiter.resolve = (val) => { clearTimeout(timer); origResolve(val); };
+    });
+  }
+
+  /**
+   * Returns structured per-phase metrics grouped by event name.
+   * Single-occurrence events are stored as objects; repeated events as arrays.
+   */
+  getSummary() {
+    const summary = {};
+    for (const entry of this._entries) {
+      const key = entry.name;
+      if (!key) continue;
+      const record = { durationMs: entry.durationMs, sequence: entry.sequence };
+      // Preserve useful metadata
+      if (entry.model) record.model = entry.model;
+      if (entry.iteration !== undefined) record.iteration = entry.iteration;
+      if (entry.error) record.error = entry.error;
+
+      if (!summary[key]) {
+        summary[key] = record;
+      } else if (Array.isArray(summary[key])) {
+        summary[key].push(record);
+      } else {
+        summary[key] = [summary[key], record];
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Returns a compact one-line string summarising key phases.
+   * e.g. "session=1234ms first_inf=89ms avg_inf=42ms"
+   */
+  toCompactString() {
+    const entries = this._entries;
+    if (entries.length === 0) return '';
+
+    const parts = [];
+
+    const sessionEntries = entries.filter(e => e.name === 'webnn.session.create');
+    if (sessionEntries.length > 0) {
+      const totalSession = sessionEntries.reduce((s, e) => s + (e.durationMs || 0), 0);
+      parts.push(`session=${totalSession.toFixed(1)}ms`);
+    }
+
+    const fetchEntries = entries.filter(e => e.name === 'webnn.model.fetch');
+    if (fetchEntries.length > 0) {
+      const totalFetch = fetchEntries.reduce((s, e) => s + (e.durationMs || 0), 0);
+      parts.push(`fetch=${totalFetch.toFixed(1)}ms`);
+    }
+
+    const firstInf = entries.find(e => e.name === 'webnn.inference.first');
+    if (firstInf) {
+      parts.push(`first_inf=${firstInf.durationMs.toFixed(1)}ms`);
+    }
+
+    const infEntries = entries.filter(e => e.name === 'webnn.inference');
+    if (infEntries.length > 0) {
+      const avg = infEntries.reduce((s, e) => s + (e.durationMs || 0), 0) / infEntries.length;
+      parts.push(`avg_inf=${avg.toFixed(1)}ms`);
+    }
+
+    return parts.join(' ');
+  }
+}
+
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
