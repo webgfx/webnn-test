@@ -38,35 +38,30 @@ class ModelRunner extends WebNNRunner {
         name: 'WebNN Developer Preview Image Classification',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/image-classification',
         type: 'preview',
-        devices: ['cpu', 'gpu', 'npu'],
         func: this.runModelImageClassification
       },
       'sam': {
         name: 'WebNN Developer Preview Segment Anything',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/segment-anything/',
         type: 'preview',
-        devices: ['gpu', 'npu'],
         func: this.runModelSam
       },
       'whisper': {
         name: 'WebNN Developer Preview Whisper-base WebGPU',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/whisper-base/',
         type: 'preview',
-        devices: ['gpu', 'npu'],
         func: this.runModelWhisper
       },
       'sdxl': {
         name: 'WebNN Developer Preview SDXL Turbo',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/sdxl-turbo/',
         type: 'preview',
-        devices: ['gpu'],
         func: this.runModelSdxl
       },
       'phi': {
         name: 'WebNN Developer Preview Phi WebGPU',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/text-generation/',
         type: 'preview',
-        devices: ['gpu', 'npu'],
         func: this.runModelPhi
       }
     };
@@ -106,21 +101,6 @@ class ModelRunner extends WebNNRunner {
       const modelDef = this.models[key];
       const startTime = Date.now();
       let infinityErrorDetected = false;
-
-      // Skip tests that don't support the current device
-      const device = (process.env.DEVICE || 'cpu').toLowerCase();
-      if (modelDef.devices && !modelDef.devices.includes(device)) {
-        console.log(`[Skip] ${modelDef.name} does not support device '${device}' (supported: ${modelDef.devices.join(', ')})`);
-        results.push({
-            testName: modelDef.name,
-            testUrl: modelDef.url,
-            result: 'SKIP',
-            details: `Skipped: device '${device}' not supported (supported: ${modelDef.devices.join(', ')})`,
-            subcases: { total: 1, passed: 0, failed: 0 },
-            suite: 'model'
-        });
-        continue;
-      }
 
       try {
         await this.runTestWithSessionCheck(async () => {
