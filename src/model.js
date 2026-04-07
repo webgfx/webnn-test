@@ -1,5 +1,5 @@
 
-const { WebNNRunner } = require('./util');
+const { WebNNRunner, WebNNPerfCollector } = require('./util');
 const { expect } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
@@ -40,18 +40,6 @@ class ModelRunner extends WebNNRunner {
         type: 'preview',
         func: this.runModelImageClassification
       },
-      'sdxl': {
-        name: 'WebNN Developer Preview SDXL Turbo',
-        url: 'https://microsoft.github.io/webnn-developer-preview/demos/sdxl-turbo/',
-        type: 'preview',
-        func: this.runModelSdxl
-      },
-      'phi': {
-        name: 'WebNN Developer Preview Phi WebGPU',
-        url: 'https://microsoft.github.io/webnn-developer-preview/demos/text-generation/',
-        type: 'preview',
-        func: this.runModelPhi
-      },
       'sam': {
         name: 'WebNN Developer Preview Segment Anything',
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/segment-anything/',
@@ -63,6 +51,18 @@ class ModelRunner extends WebNNRunner {
         url: 'https://microsoft.github.io/webnn-developer-preview/demos/whisper-base/',
         type: 'preview',
         func: this.runModelWhisper
+      },
+      'sdxl': {
+        name: 'WebNN Developer Preview SDXL Turbo',
+        url: 'https://microsoft.github.io/webnn-developer-preview/demos/sdxl-turbo/',
+        type: 'preview',
+        func: this.runModelSdxl
+      },
+      'phi': {
+        name: 'WebNN Developer Preview Phi WebGPU',
+        url: 'https://microsoft.github.io/webnn-developer-preview/demos/text-generation/',
+        type: 'preview',
+        func: this.runModelPhi
       }
     };
   }
@@ -165,9 +165,22 @@ class ModelRunner extends WebNNRunner {
           await onFirstCaseComplete();
       }
 
-      // Pause between tests
+      // Pause between tests and navigate away to release WebNN resources
       if (!this.page.isClosed()) {
-         await this.page.waitForTimeout(2000);
+         try { await this.page.goto('about:blank', { waitUntil: 'load', timeout: 5000 }); } catch(e) {}
+         try { await this.page.waitForTimeout(2000); } catch(e) {}
+      } else {
+         // Page/browser crashed during the test — ensure recovery before next test
+         console.log('[Info] Page closed after test, ensuring browser is available for next test...');
+         try { await this.ensurePage(); } catch(e) {
+           console.log('[Warning] Could not recover page, will try restartBrowserAndContext...');
+           try {
+             const instance = await this.restartBrowserAndContext(null);
+             this.page = instance.page;
+           } catch(e2) {
+             console.error(`[Error] Browser recovery failed: ${e2.message}`);
+           }
+         }
       }
     }
 
@@ -585,9 +598,13 @@ class ModelRunner extends WebNNRunner {
     const baseUrl = modelDef.url.split('?')[0];
     const testUrl = `${baseUrl}?provider=webnn&devicetype=${device}&model=resnet-50&run=5`;
 
+    const perfCollector = new WebNNPerfCollector();
+
     try {
       console.log(`Running preview test: ${testName} on ${device}`);
       console.log(`Navigating to: ${testUrl}`);
+
+      perfCollector.start(this.page);
 
       await this.page.goto(testUrl);
       await this.page.waitForLoadState('networkidle');
@@ -656,16 +673,22 @@ class ModelRunner extends WebNNRunner {
       if (!latencyFound) throw new Error(`latency element not found after ${maxChecks} attempts`);
       if (!latencyValue.includes('ms')) latencyValue += ' ms';
 
+      const perfSummary = perfCollector.toCompactString();
+      if (perfSummary) console.log(`[WebNN:Perf] IC metrics: ${perfSummary}`);
+
       results.push({
         testName: testName,
         testUrl: testUrl,
         result: 'PASS',
         details: `Latency: ${latencyValue}`,
+        perfMetrics: perfCollector.getSummary(),
+        perfSummary: perfSummary,
         subcases: { total: 1, passed: 1, failed: 0 },
         suite: 'model'
       });
 
     } catch (error) { throw error; }
+    finally { perfCollector.stop(); }
   }
 
   async runModelSdxl(results, modelDef) {
@@ -679,53 +702,99 @@ class ModelRunner extends WebNNRunner {
     console.log(`Running preview test: ${testName} on ${device}`);
     console.log(`Navigating to: ${testUrl}`);
 
+    const perfCollector = new WebNNPerfCollector();
+
     try {
+      perfCollector.start(this.page);
+
       await this.page.goto(testUrl);
       await this.page.waitForLoadState('domcontentloaded');
 
-      const loadButton = this.page.locator('button', { hasText: 'Load Models' });
-      await loadButton.waitFor({ state: 'visible', timeout: 30000 });
-      await loadButton.click();
-      console.log('[Success] Clicked Load Models');
-
-      const generateButton = this.page.locator('button', { hasText: 'Generate Image' });
-      await generateButton.waitFor({ state: 'visible', timeout: 600000 });
-      await expect(generateButton).toBeEnabled({ timeout: 600000 });
-
-      console.log('[Success] Models loaded. Clicking Generate Image...');
-      await generateButton.click();
-
-      const resultLocator = this.page.locator('#total_data');
-      await resultLocator.waitFor({ state: 'visible', timeout: 120000 });
-
-      let resultText = '';
-      let checkCount = 0;
-      const maxChecks = 1200;
-
-      while (checkCount < maxChecks) {
-          const text = await resultLocator.textContent();
-          resultText = text ? text.trim() : '';
-          if (resultText && resultText !== '...' && /\d/.test(resultText)) {
-              break;
+      // Monitor for WebNN/ORT errors to fail fast instead of waiting full timeout
+      let loadError = null;
+      const errorPatterns = [
+          "failed to create session",
+          "failed to create context",
+          "out of memory",
+          "unrecognized graph input",
+      ];
+      const errorListener = (msg) => {
+          if (msg.type() === 'error' && !loadError) {
+              const text = msg.text().toLowerCase();
+              for (const pattern of errorPatterns) {
+                  if (text.includes(pattern)) {
+                      loadError = msg.text();
+                      console.log(`[SDXL] Detected error during load: ${msg.text()}`);
+                      break;
+                  }
+              }
           }
-          await this.page.waitForTimeout(500);
-          checkCount++;
-      }
+      };
+      this.page.on('console', errorListener);
 
-      if (!resultText || resultText === '...' || !/\d/.test(resultText)) {
-          throw new Error('Result text did not appear or invalid');
-      }
+      try {
+        const loadButton = this.page.locator('button', { hasText: 'Load Models' });
+        await loadButton.waitFor({ state: 'visible', timeout: 30000 });
+        await loadButton.click();
+        console.log('[Success] Clicked Load Models');
 
-      results.push({
-          testName: testName,
-          testUrl: testUrl,
-          result: 'PASS',
-          details: `Total time: ${resultText}`,
-          subcases: { total: 1, passed: 1, failed: 0 },
-          suite: 'model'
-      });
+        // Poll for Generate Image button with fast-fail on errors
+        const generateButton = this.page.locator('button', { hasText: 'Generate Image' });
+        let genVisible = false;
+        for (let i = 0; i < 1800; i++) { // up to 15 min
+            if (loadError) throw new Error(`Model load failed: ${loadError}`);
+            const visible = await generateButton.isVisible().catch(() => false);
+            const enabled = visible ? await generateButton.isEnabled().catch(() => false) : false;
+            if (visible && enabled) { genVisible = true; break; }
+            await this.page.waitForTimeout(500);
+        }
+
+        if (loadError) throw new Error(`Model load failed: ${loadError}`);
+        if (!genVisible) throw new Error('Generate Image button did not become visible/enabled');
+
+        console.log('[Success] Models loaded. Clicking Generate Image...');
+        await generateButton.click();
+
+        const resultLocator = this.page.locator('#total_data');
+        await resultLocator.waitFor({ state: 'visible', timeout: 120000 });
+
+        let resultText = '';
+        let checkCount = 0;
+        const maxChecks = 1200;
+
+        while (checkCount < maxChecks) {
+            const text = await resultLocator.textContent();
+            resultText = text ? text.trim() : '';
+            if (resultText && resultText !== '...' && /\d/.test(resultText)) {
+                break;
+            }
+            await this.page.waitForTimeout(500);
+            checkCount++;
+        }
+
+        if (!resultText || resultText === '...' || !/\d/.test(resultText)) {
+            throw new Error('Result text did not appear or invalid');
+        }
+
+        const perfSummary = perfCollector.toCompactString();
+        if (perfSummary) console.log(`[WebNN:Perf] SDXL metrics: ${perfSummary}`);
+
+        results.push({
+            testName: testName,
+            testUrl: testUrl,
+            result: 'PASS',
+            details: `Total time: ${resultText}`,
+            perfMetrics: perfCollector.getSummary(),
+            perfSummary: perfSummary,
+            subcases: { total: 1, passed: 1, failed: 0 },
+            suite: 'model'
+        });
+      } finally {
+        try { this.page.removeListener('console', errorListener); } catch(e) {}
+      }
 
     } catch (e) { throw e; }
+    finally { perfCollector.stop(); }
   }
 
   async runModelPhi(results, modelDef) {
@@ -739,7 +808,11 @@ class ModelRunner extends WebNNRunner {
       console.log(`Running preview test: ${testName} on ${device}`);
       console.log(`Navigating to: ${testUrl}`);
 
+      const perfCollector = new WebNNPerfCollector();
+
       try {
+        perfCollector.start(this.page);
+
         await this.page.goto(testUrl);
         await this.page.waitForLoadState('domcontentloaded');
 
@@ -748,8 +821,8 @@ class ModelRunner extends WebNNRunner {
         const sendBtn = this.page.locator('#send-button');
 
         console.log("Waiting for model to load (#send-button to become enabled)...");
-        await sendBtn.waitFor({ state: 'visible', timeout: 600000 });
-        await expect(sendBtn).not.toBeDisabled({ timeout: 600000 });
+        await sendBtn.waitFor({ state: 'visible', timeout: 900000 });
+        await expect(sendBtn).not.toBeDisabled({ timeout: 900000 });
         console.log("Model loaded. Send button is enabled.");
 
         // Type a prompt into the #user-input contenteditable div
@@ -815,11 +888,17 @@ class ModelRunner extends WebNNRunner {
           if (!perfText) throw new Error("No token/sec result found in #performance-indicator");
 
           console.log(`Performance result: ${perfText}`);
+
+          const perfSummary = perfCollector.toCompactString();
+          if (perfSummary) console.log(`[WebNN:Perf] Phi metrics: ${perfSummary}`);
+
           results.push({
             testName: testName,
             testUrl: testUrl,
             result: 'PASS',
             details: `Performance: ${perfText.replace(/\n/g, ', ')}`,
+            perfMetrics: perfCollector.getSummary(),
+            perfSummary: perfSummary,
             subcases: { total: 1, passed: 1, failed: 0 },
             suite: 'model'
           });
@@ -829,6 +908,7 @@ class ModelRunner extends WebNNRunner {
         }
 
       } catch (e) { throw e; }
+      finally { perfCollector.stop(); }
   }
 
   async runModelSam(results, modelDef) {
@@ -842,62 +922,94 @@ class ModelRunner extends WebNNRunner {
     console.log(`Running preview test: ${testName} on ${device}`);
     console.log(`Navigating to: ${testUrl}`);
 
+    const perfCollector = new WebNNPerfCollector();
+
     try {
+        perfCollector.start(this.page);
+
         await this.page.goto(testUrl);
         await this.page.waitForLoadState('domcontentloaded');
 
-        // The canvas starts hidden (class="none") and only becomes visible
-        // after both SAM models (~187MB total) are downloaded and compiled.
-        // Use a generous timeout to account for model loading time.
-        console.log("Waiting for canvas (model loading may take a while)...");
-        const canvas = this.page.locator('#img_canvas');
-        await canvas.waitFor({ state: 'visible', timeout: 300000 });
+        // Monitor for WebNN/ORT errors to fail fast
+        let loadError = null;
+        const errorListener = (msg) => {
+            if (msg.type() === 'error' && !loadError) {
+                const text = msg.text().toLowerCase();
+                if (text.includes('failed to create session') || text.includes('failed to create context') ||
+                    text.includes('out of memory') || text.includes('unrecognized graph input')) {
+                    loadError = msg.text();
+                    console.log(`[SAM] Detected load error: ${msg.text()}`);
+                }
+            }
+        };
+        this.page.on('console', errorListener);
 
-        // After canvas is visible, the default image (EgyptianCat.png) is
-        // processed by the encoder via handleImage(). Wait for the cursor
-        // to change from "wait" to "default" indicating the encoder is done.
-        console.log("Waiting for encoder to finish processing default image...");
-        let encoderReady = false;
-        for (let i = 0; i < 600; i++) { // up to 5 min
-            const cursor = await canvas.evaluate(el => el.style.cursor);
-            if (cursor !== 'wait') { encoderReady = true; break; }
-            await this.page.waitForTimeout(500);
+        try {
+            // The canvas starts hidden (class="none") and only becomes visible
+            // after both SAM models (~187MB total) are downloaded and compiled.
+            // Use a generous timeout to account for model loading time.
+            console.log("Waiting for canvas (model loading may take a while)...");
+            const canvas = this.page.locator('#img_canvas');
+            await canvas.waitFor({ state: 'visible', timeout: 300000 });
+
+            // After canvas is visible, the default image (EgyptianCat.png) is
+            // processed by the encoder via handleImage(). Wait for the cursor
+            // to change from "wait" to "default" indicating the encoder is done.
+            console.log("Waiting for encoder to finish processing default image...");
+            let encoderReady = false;
+            for (let i = 0; i < 600; i++) { // up to 5 min
+                if (loadError) throw new Error(`Model load failed: ${loadError}`);
+                const cursor = await canvas.evaluate(el => el.style.cursor);
+                if (cursor !== 'wait') { encoderReady = true; break; }
+                await this.page.waitForTimeout(500);
+            }
+            if (loadError) throw new Error(`Model load failed: ${loadError}`);
+            if (!encoderReady) throw new Error("Encoder did not finish processing the image in time");
+
+            console.log("Clicking on canvas to trigger segmentation...");
+            const box = await canvas.boundingBox();
+            if (box) {
+                await this.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+            } else {
+                throw new Error("Canvas bounding box not found");
+            }
+
+            // The demo uses #decoder_latency for the latency display
+            const latEl = this.page.locator('#decoder_latency');
+
+            // It might take time for first inference
+            let latText = '';
+            let checks = 0;
+            while(checks < 120) {
+                if (loadError) throw new Error(`Inference failed: ${loadError}`);
+                latText = await latEl.innerText().catch(() => '');
+                if (latText && /\d/.test(latText) && !latText.includes('...')) break;
+                await this.page.waitForTimeout(500);
+                checks++;
+            }
+
+            if (loadError) throw new Error(`Inference failed: ${loadError}`);
+            if (!latText) throw new Error("Latency not displayed in #decoder_latency");
+
+            const perfSummary = perfCollector.toCompactString();
+            if (perfSummary) console.log(`[WebNN:Perf] SAM metrics: ${perfSummary}`);
+
+            results.push({
+                testName: testName,
+                testUrl: testUrl,
+                result: 'PASS',
+                details: `Latency: ${latText}`,
+                perfMetrics: perfCollector.getSummary(),
+                perfSummary: perfSummary,
+                subcases: { total: 1, passed: 1, failed: 0 },
+                suite: 'model'
+            });
+        } finally {
+            try { this.page.removeListener('console', errorListener); } catch(e) {}
         }
-        if (!encoderReady) throw new Error("Encoder did not finish processing the image in time");
-
-        console.log("Clicking on canvas to trigger segmentation...");
-        const box = await canvas.boundingBox();
-        if (box) {
-            await this.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-        } else {
-            throw new Error("Canvas bounding box not found");
-        }
-
-        // The actual latency element ID is "decoder_latency", not "latency"
-        const latEl = this.page.locator('#decoder_latency');
-
-        // Poll for a numeric latency value to appear
-        let latText = '';
-        let checks = 0;
-        while(checks < 120) { // up to 60 seconds
-            latText = await latEl.innerText().catch(() => '');
-            if (latText && /\d/.test(latText)) break;
-            await this.page.waitForTimeout(500);
-            checks++;
-        }
-
-        if (!latText) throw new Error("Decoder latency not displayed");
-
-        results.push({
-            testName: testName,
-            testUrl: testUrl,
-            result: 'PASS',
-            details: `Decoder Latency: ${latText}ms`,
-            subcases: { total: 1, passed: 1, failed: 0 },
-            suite: 'model'
-        });
 
     } catch(e) { throw e; }
+    finally { perfCollector.stop(); }
   }
 
   async runModelWhisper(results, modelDef) {
@@ -911,23 +1023,66 @@ class ModelRunner extends WebNNRunner {
       console.log(`Running preview test: ${testName} on ${device}`);
       console.log(`Navigating to: ${testUrl}`);
 
+      const perfCollector = new WebNNPerfCollector();
+
       try {
+          perfCollector.start(this.page);
+
           await this.page.goto(testUrl);
           await this.page.waitForLoadState('domcontentloaded');
 
+          // Monitor for WebNN/ORT errors to fail fast
+          let loadError = null;
+          const errorPatterns = [
+              "failed to create session",
+              "failed to create context",
+              "session initialization failed",
+              "out of memory",
+              "unrecognized graph input",
+          ];
+          const errorListener = (msg) => {
+              if (msg.type() === 'error' && !loadError) {
+                  const text = msg.text().toLowerCase();
+                  for (const pattern of errorPatterns) {
+                      if (text.includes(pattern)) {
+                          loadError = msg.text();
+                          console.log(`[Whisper] Detected load error: ${msg.text()}`);
+                          break;
+                      }
+                  }
+              }
+          };
+          this.page.on('console', errorListener);
+
+          try {
           // The whisper-base demo auto-loads the model on page init (no Load button).
           // When the model is ready, controls like #file-upload become enabled.
           const fileUpload = this.page.locator('#file-upload');
 
           console.log("Waiting for model to load (#file-upload to become enabled)...");
           await fileUpload.waitFor({ state: 'attached', timeout: 300000 });
-          // Poll for the input to become enabled
+          // Poll for the input to become enabled.
+          // Use a per-call timeout on isDisabled() to prevent hanging when the
+          // page's JS event loop is blocked by a long ORT session compilation.
           let modelReady = false;
           for (let i = 0; i < 600; i++) { // up to 5 min
-            const isDisabled = await fileUpload.isDisabled();
-            if (!isDisabled) { modelReady = true; break; }
+            if (loadError) throw new Error(`Model load failed: ${loadError}`);
+            try {
+              const isDisabled = await Promise.race([
+                fileUpload.isDisabled(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('isDisabled timeout')), 10000))
+              ]);
+              if (!isDisabled) { modelReady = true; break; }
+            } catch (e) {
+              if (e.message === 'isDisabled timeout') {
+                console.log(`[Whisper] Page JS unresponsive (iteration ${i}), ORT session may be compiling...`);
+                continue;
+              }
+              throw e;
+            }
             await this.page.waitForTimeout(500);
           }
+          if (loadError) throw new Error(`Model load failed: ${loadError}`);
           if (!modelReady) throw new Error("Whisper model failed to load (file-upload stayed disabled)");
           console.log("Model loaded. Controls are enabled.");
 
@@ -988,16 +1143,26 @@ class ModelRunner extends WebNNRunner {
               console.log(`[Whisper] FAIL: Only ${matchedWords.length}/${expectedWords.length} words matched (need >= ${MIN_WORD_MATCHES})`);
             }
 
+            const perfSummary = perfCollector.toCompactString();
+            if (perfSummary) console.log(`[WebNN:Perf] Whisper metrics: ${perfSummary}`);
+
             results.push({
               testName: testName,
               testUrl: testUrl,
               result: transcriptionOk ? 'PASS' : 'FAIL',
               details: `Transcription: ${transcription || '(blank)'}. ${latencyText}${wordMatchInfo}`,
+              perfMetrics: perfCollector.getSummary(),
+              perfSummary: perfSummary,
               subcases: { total: 1, passed: transcriptionOk ? 1 : 0, failed: transcriptionOk ? 0 : 1 },
               suite: 'model'
             });
 
+          } finally {
+            try { this.page.removeListener('console', errorListener); } catch(e) {}
+          }
+
       } catch(e) { throw e; }
+      finally { perfCollector.stop(); }
   }
 }
 

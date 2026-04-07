@@ -8,7 +8,7 @@ const { test, expect, chromium } = require('@playwright/test');
 
 const { WptRunner } = require('./wpt');
 const { ModelRunner } = require('./model');
-const { launchBrowser, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
+const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
 
 // Helper to parse comma-separated lists
 const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
@@ -312,10 +312,17 @@ Examples:
 
   test.describe('WebNN Tests', () => {
       let browser, context, page;
+      let browserRootPid = null;
       const launchInstance = async () => launchBrowser();
 
       test.afterAll(async () => {
-          if (browser) await browser.close();
+          if (browser) {
+              try { await browser.close(); } catch (e) {}
+          }
+          // Kill only our automation's browser process tree (not the user's personal browser).
+          if (browserRootPid) {
+              killOwnBrowserProcesses(browserRootPid);
+          }
       });
 
       if (process.env.IS_LIST_MODE === 'true') {
@@ -390,6 +397,14 @@ Examples:
                    context = instance.context;
                    page = instance.page;
 
+                   // Track the browser root PID for targeted cleanup
+                   try {
+                       const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
+                       const pName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
+                       browserRootPid = findBrowserRootPid(pName);
+                       if (browserRootPid) console.log(`[Info] Browser root PID: ${browserRootPid}`);
+                   } catch (e) { /* best effort */ }
+
                    // Capture browser info on first launch
                    if (!browserInfo) {
                        try {
@@ -428,6 +443,7 @@ Examples:
                        currentRunner = new ModelRunner(page);
                        currentRunner.launchNewBrowser = launchInstance;
                    }
+                   if (browserRootPid) currentRunner.browserRootPid = browserRootPid;
                    runner = currentRunner;
 
                    if (idx === 0) {
@@ -445,7 +461,8 @@ Examples:
                    // Callback to run DLL check after first case execution
                    const onFirstCaseComplete = async () => {
                        if (!currentDllResults) {
-                           const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
+                           const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
+                           const processName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
                            console.log('[Info] First case completed. Checking DLLs...');
                            currentDllResults = await currentRunner.checkOnnxruntimeDlls(processName);
                        }
@@ -705,6 +722,10 @@ Examples:
                                // Append subcase counts if available
                                if (r.subcases && r.subcases.total > 0) {
                                    line += ` [${r.subcases.passed}/${r.subcases.total}]`;
+                               }
+                               // Append WebNN perf metrics summary if available
+                               if (r.perfSummary) {
+                                   line += `\n  perf: ${r.perfSummary}`;
                                }
                                // Append detailed failure messages for WPT if available
                                if (r.failedSubtests && r.failedSubtests.length > 0) {
