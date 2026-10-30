@@ -833,31 +833,60 @@ class ModelRunner extends WebNNRunner {
 
       const startTime = Date.now();
       const resultsBefore = results.length;
+      const caseResults = [];
       let infinityErrorDetected = false;
+      let stopDiagnostics = () => {};
+      const diagnostics = [];
+      const remember = text => {
+        diagnostics.push(String(text).slice(0, 1000));
+        if (diagnostics.length > 10) diagnostics.shift();
+      };
       // --model-timeout (MODEL_TIMEOUT, seconds) overrides each case's own watchdog.
       const modelTimeoutSec = Number(process.env.MODEL_TIMEOUT);
       const timeoutMs = modelTimeoutSec > 0 ? modelTimeoutSec * 1000 : (caseDef.timeoutMs || DEFAULT_CASE_TIMEOUT);
 
       try {
         await this.runTestWithSessionCheck(async () => {
+             const casePage = this.page;
+             const caseRunner = Object.create(this);
+             caseRunner.page = casePage;
              // Setup console listener for infinity checks (common in preview)
              const consoleListener = async (msg) => {
+                if (msg.type() === 'error') remember(`Console: ${msg.text()}`);
                 if (msg.text().includes('Found infinity in logits')) {
                   console.error(`[Fail] [Auto-Fail] "Found infinity in logits" detected. Quitting case...`);
                   infinityErrorDetected = true;
-                  try { await this.page.close(); } catch (e) {}
+                  try { await casePage.close(); } catch (e) {}
                 }
              };
-             this.page.on('console', consoleListener);
+             const pageErrorListener = error => remember(`Page error: ${error.message}`);
+             const requestFailedListener = request => remember(`Request failed: ${request.url()} (${request.failure()?.errorText || 'unknown error'})`);
+             const responseListener = response => {
+               if (response.status() >= 400) remember(`HTTP ${response.status()}: ${response.url()}`);
+             };
+             casePage.on('console', consoleListener);
+             casePage.on('pageerror', pageErrorListener);
+             casePage.on('requestfailed', requestFailedListener);
+             casePage.on('response', responseListener);
 
-             try {
-                await caseDef.func.call(this, results, caseDef, caseDef.variant);
-             } finally {
-                if (!this.page.isClosed()) {
-                  this.page.off('console', consoleListener);
-                }
-             }
+             stopDiagnostics = () => {
+                casePage.off('console', consoleListener);
+                casePage.off('pageerror', pageErrorListener);
+                casePage.off('requestfailed', requestFailedListener);
+                casePage.off('response', responseListener);
+             };
+             await caseDef.func.call(caseRunner, caseResults, caseDef, caseDef.variant);
         }, true, { timeoutMs });
+        for (const result of caseResults) {
+          if (!['PASS', 'SKIP'].includes(result.result) || result.hasErrors || result.subcases?.failed > 0) {
+            result.fullText = [
+              result.fullText || result.details || `Model case returned ${result.result}`,
+              ...diagnostics
+            ].join('\n');
+            result.hasErrors = true;
+          }
+        }
+        results.push(...caseResults);
       } catch (error) {
         if (infinityErrorDetected) {
             error.message = "Found infinity in logits";
@@ -865,19 +894,19 @@ class ModelRunner extends WebNNRunner {
 
         console.error(`[Fail] Error running model case ${caseDef.name}:`, error.message);
 
-        // Runners push their own result on success; only add one if this case has none yet.
-        if (results.length === resultsBefore) {
-             results.push({
-                testName: caseDef.name,
-                testUrl: caseDef.url,
-                result: 'ERROR',
-                errors: [{ text: error.message }],
-                fullText: error.message,
-                hasErrors: true,
-                subcases: { total: 1, passed: 0, failed: 1 },
-                suite: 'model'
-             });
-        }
+        const fullText = [error.message, ...diagnostics].join('\n');
+        results.push({
+          testName: caseDef.name,
+          testUrl: caseDef.url,
+          result: 'ERROR',
+          errors: [{ text: fullText }],
+          fullText,
+          hasErrors: true,
+          subcases: { total: 1, passed: 0, failed: 1 },
+          suite: 'model'
+        });
+      } finally {
+        stopDiagnostics();
       }
 
       // Add execution time to the result this case produced

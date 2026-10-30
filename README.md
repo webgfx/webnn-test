@@ -380,6 +380,9 @@ After test execution completes, an HTML report is automatically generated with:
 
 ### Report Files
 
+The CLI exits nonzero when any case fails or errors, after saving the reports.
+Text reports include case diagnostics and reasons for skipped cases.
+
 Reports are saved in the `results/` directory:
 
 - **Timestamped Reports**: Each test run generates a timestamped file (format: `YYYYMMDDHHMMSS.html`)
@@ -388,7 +391,8 @@ Reports are saved in the `results/` directory:
 
 ### Viewing Reports
 
-Reports are automatically opened in your default browser after test completion. To view reports manually:
+Reports are not opened automatically, so failed runs can exit without waiting for
+Playwright's report server. Set `PLAYWRIGHT_HTML_OPEN=on-failure` to opt in, or view reports manually:
 
 ```bash
 # Open the report directory
