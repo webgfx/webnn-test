@@ -87,7 +87,8 @@ Options:
   --browser-path <path>    Custom path to browser executable
   --skip-retry             Skip the retry stage for failed tests
   --baseline <folder>      Baseline folder (timestamp) for comparison
-  --model-timeout <sec>    Per-case watchdog for model cases (default: 600)
+  --model-timeout <sec>    Per-case watchdog for model cases, overriding each case's
+                           own (default: 600; up to 5400 for large preview models)
   --wpt-timeout <sec>      Per-test timeout for WPT cases (default: 60)
   --wpt-base-url <url>     WPT server root (default: https://wpt.live),
                            e.g. http://localhost:8000 for a local 'wpt serve'
@@ -95,12 +96,15 @@ Options:
 Test Selection:
   --wpt-case <filter>      Run specific WPT test cases
   --wpt-range <range>      Run tests by index range
-  --model-case <filter>    Run specific Model cases
+  --model-case <filter>    Run specific Model cases; key:variantA+variantB selects variants
+  --model-variants <mode>  Model variants to run (default: default). Values: default, all
 
 Examples:
   node src/main.js --config config.json
   node src/main.js --suite wpt --wpt-case abs
   node src/main.js --suite wpt --browser edge --browser-channel canary
+  node src/main.js --suite model --model-case od:ssdmobilenetv1-fp16,lenet --device gpu
+  node src/main.js --suite model --model-case ic-sample --model-variants all
 `);
     process.exit(0);
   }
@@ -205,6 +209,19 @@ Examples:
   const modelTimeout = parseTimeoutArg('--model-timeout');
   const wptTimeout = parseTimeoutArg('--wpt-timeout');
 
+  const validVariantModes = ['default', 'all'];
+  const parseVariantMode = (value, source) => {
+      const mode = (value || 'default').toLowerCase();
+      if (!validVariantModes.includes(mode)) {
+          console.error(`Invalid ${source} value: ${value}`);
+          console.error(`Valid values are: ${validVariantModes.join(', ')}`);
+          process.exit(1);
+      }
+      return mode;
+  };
+  const modelVariantsArg = getRequiredValueArg('--model-variants');
+  const modelVariants = parseVariantMode(modelVariantsArg, '--model-variants');
+
   const wptBaseUrl = getRequiredValueArg('--wpt-base-url');
   if (wptBaseUrl !== null) {
       let parsed = null;
@@ -241,6 +258,9 @@ Examples:
                   browserArgs: item['browser-arg'] ? `${globalExtraArgs || ''} ${item['browser-arg']}`.trim() : globalExtraArgs,
                   wptCase: item['wpt-case'] || null,
                   modelCase: item['model-case'] || null,
+                  // An explicit CLI --model-variants overrides the config file.
+                  modelVariants: modelVariantsArg !== null ? modelVariants :
+                      parseVariantMode(item['model-variants'], `"model-variants" in ${configFile}`),
                   wptRange: null,
                   pauseCase: null
                }));
@@ -276,6 +296,7 @@ Examples:
                   browserArgs: globalExtraArgs,
                   wptCase: (s === 'wpt') ? (getArg('--wpt-case') || wptCase) : null,
                   modelCase: (s === 'model') ? (getArg('--model-case') || modelCase) : null,
+                  modelVariants: modelVariants,
                   wptRange: wptRange,
                   pauseCase: pauseCase
               });
@@ -307,6 +328,7 @@ Examples:
   delete process.env.DEVICE;
   delete process.env.WPT_CASE;
   delete process.env.MODEL_CASE;
+  delete process.env.MODEL_VARIANTS;
   delete process.env.EXTRA_BROWSER_ARGS;
 
   // --- Execution & Iteration Loop ---
@@ -442,7 +464,19 @@ Examples:
                         const runner = new ModelRunner(page);
                         Object.keys(runner.models).forEach((k, i) => {
                              const m = runner.models[k];
-                             console.log(`[${i}] ${k}: ${m.name} (${m.type})`);
+                             const devices = (m.devices || ['cpu', 'gpu', 'npu']).join(',');
+                             console.log(`[${i}] ${k}: ${m.name} (${m.type}) devices=${devices}${m.optIn ? ' [opt-in]' : ''}`);
+                             const variantIds = Object.keys(m.variants || {});
+                             if (variantIds.length > 0) {
+                                 const defaults = typeof m.defaultVariant === 'string' ? { default: m.defaultVariant } : (m.defaultVariant || {});
+                                 for (const id of variantIds) {
+                                     const v = m.variants[id];
+                                     const marks = Object.entries(defaults).filter(([, d]) => d === id)
+                                         .map(([dev]) => dev === 'default' ? 'default' : `default on ${dev}`);
+                                     const only = v.devices ? ` devices=${v.devices.join(',')}` : '';
+                                     console.log(`      ${k}:${id} - ${v.label}${only}${marks.length ? ` (${marks.join(', ')})` : ''}`);
+                                 }
+                             }
                         });
                     }
                }
@@ -542,6 +576,7 @@ Examples:
 
                    process.env.WPT_CASE = config.wptCase || '';
                    process.env.MODEL_CASE = config.modelCase || '';
+                   process.env.MODEL_VARIANTS = config.modelVariants || 'default';
                    process.env.WPT_RANGE = config.wptRange || '';
                    process.env.PAUSE_CASE = config.pauseCase || '';
 

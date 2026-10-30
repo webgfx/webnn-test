@@ -70,6 +70,9 @@ Example configuration format:
 ]
 ```
 
+Model suite entries also accept `"model-case"` and `"model-variants"` (`default`
+or `all`); a `--model-variants` command-line argument overrides the file.
+
 ## Test Case Selection
 
 Use `--wpt-case` to run only tests that start string(s). Multiple cases can be specified separated by commas (no spaces):
@@ -90,40 +93,105 @@ The case selection is case-insensitive and matches the prefix of the test filena
 
 ## Model Tests (Samples & Previews)
 
-Run tests against WebNN samples and developer previews using the `model` suite:
+Run tests against [WebNN Samples](https://webmachinelearning.github.io/webnn-samples/)
+and the [WebNN Developer Preview](https://microsoft.github.io/webnn-developer-preview/)
+using the `model` suite:
 
 ```bash
-# Run all model tests
+# Run all model tests (one representative variant per case)
 node src/main.js --suite model
 
 # Run specific model cases
 node src/main.js --suite model --model-case lenet
 node src/main.js --suite model --model-case sdxl,whisper
 node src/main.js --suite model --model-case stem --device npu
+
+# Run specific variants of a case (key:variantA+variantB)
+node src/main.js --suite model --model-case od:ssdmobilenetv1-fp16,ic:mobilenet-v2+efficientnet-lite4
+
+# Run every variant of every case, or of selected cases
+node src/main.js --suite model --model-variants all
+node src/main.js --suite model --model-case ic-sample,style --model-variants all
+node src/main.js --config config/model-full.json
+
+# List cases, supported devices, and variants (the default variant is marked)
+node src/main.js --suite model --list
 ```
 
-Available model cases include:
-- `lenet`: LeNet Digit Recognition
-- `segmentation`: Semantic Segmentation
-- `style`: Fast Style Transfer
-- `od`: Object Detection
-- `ic`: Image Classification
-- `sdxl`: SDXL Turbo
-- `phi`: Phi-3 WebGPU
-- `sam`: Segment Anything
-- `whisper`: Whisper-base WebGPU
-- `stem`: Stem Separator (WebNN GPU or NPU only)
+| Case | Sample | Devices | Variants (default first) |
+|---|---|---|---|
+| `lenet` | LeNet digit recognition | cpu, gpu | - |
+| `segmentation` | Semantic Segmentation (DeepLab V3 MobileNet V2) | cpu, gpu | - |
+| `style` | Fast Style Transfer | cpu, gpu | 9 styles: `starry-night`, `self-portrait`, `bedroom`, ... |
+| `od` | Object Detection | cpu, gpu, npu | `tinyyolov2-fp32` (`tinyyolov2-fp16` on NPU), `ssdmobilenetv1-fp32`/`-fp16` |
+| `ic-sample` | Image Classification | cpu, gpu, npu | `mobilenet-fp32` (`mobilenet-fp16` on NPU), `mobilenet-uint8`, `squeezenet-fp32`, `resnet50v2-*`, `resnet50v1-fp16`, `efficientnet-fp16` |
+| `nsnet2` | Noise Suppression (NSNet2) | cpu, gpu | - |
+| `rnnoise` | Noise Suppression (RNNoise) | cpu, gpu | - |
+| `selfie` | Selfie Segmentation | cpu, gpu, npu | `general-fp16`, `general-fp32`, `landscape-fp16`, `landscape-fp32` |
+| `fld` | Facial Landmark Detection | cpu, gpu | - |
+| `fr` | Face Recognition | cpu, gpu | - |
+| `ic` | Preview Image Classification | cpu, gpu, npu | `resnet-50`, `mobilenet-v2`, `efficientnet-lite4` |
+| `sam` | Preview Segment Anything | cpu, gpu, npu | `sam_b`, `sam_b_int8` |
+| `whisper` | Preview Whisper Base | cpu, gpu, npu | `float16`, `float32` |
+| `stem` | Preview Stem Separator | gpu, npu | - |
+| `sdxl` | Preview SDXL Turbo | gpu | - |
+| `sd15` | Preview Stable Diffusion 1.5 | gpu, npu | - |
+| `sdturbo` | Preview SD-Turbo | gpu, npu | - |
+| `phi` | Preview Text Generation | cpu, gpu, npu | `phi4mini`, `tinyllama`, `qwen2`, `deepseekr1` |
+| `zimage` | Preview Z-Image-Turbo (**opt-in**) | gpu | `512`, `1024` |
+
+Variant selection:
+
+- Without `--model-case`, every case except opt-in ones runs. `zimage` is opt-in
+  because it is unfinished upstream (not linked from the index; NPU unsupported).
+  Run it with `--model-case zimage`.
+- A bare case key runs its default variant; `--model-variants all` (or
+  `"model-variants": "all"` in a config file) runs all of them. `key:a+b` runs
+  the named variants regardless of `--model-variants`.
+- Each variant is reported as its own result, e.g. `Object Detection [SSD MobileNet V1 / float16]`.
+- A case or variant run on a device it does not support is reported as `SKIP`
+  with the reason, as is a variant the sample hides for the device (for example
+  `mobilenet-uint8` when the device prefers the NCHW layout, or float32 on NPU).
+  A supported device that fails is reported as a failure, never a `SKIP`.
+
+What each case verifies, beyond the page reporting timings:
+
+- Classification (`ic-sample`, `ic`, `lenet`): the top-1 class for the sample's
+  default image (`lesser panda`, `tiger`) or for a pinned MNIST digit.
+- Detection and faces (`od`, `fld`, `fr`): boxes, labels, and keypoints captured
+  from the output canvas (a `person` detection; 2 faces with 68 landmarks each;
+  all 4 search faces matched to distinct target faces).
+- Segmentation and images (`segmentation`, `selfie`, `style`, `sam`, `sdxl`,
+  `sd15`, `sdturbo`, `zimage`): the output is not blank, the `person` class is
+  present, the foreground/mask covers a plausible area, or the style changed the image.
+- Audio (`nsnet2`, `rnnoise`): the denoised audio keeps the input's duration and
+  speech envelope while removing energy.
+- Text (`phi`): a non-degenerate response that answers "What is 2 + 2?" (`qwen2`
+  is only checked for a coherent response).
+- Data types (`ic-sample`, `od`, `selfie`): the graph's constants include the
+  selected data type, so a sample that ignores the selection fails instead of
+  silently running another precision.
+- Previews: `[WebNN:Perf]` entries prove sessions and inference ran on WebNN with
+  the requested device, so a silent fallback to WASM or WebGPU fails.
 
 ### Adding a sample
 
 Register a case in `ModelRunner.models` in `src/model.js` with its name, URL,
-type (`sample` or `preview`), and runner method. Implement the method in the same
-class: select the requested device explicitly, drive the sample's normal UI,
-verify actual output, and append the standard result object (`testName`,
-`testUrl`, `result`, `details`, `subcases`, `suite: 'model'`). Throw on failure;
-`runModelTests` records the error. For instrumented previews, start a
-`WebNNPerfCollector` before navigation, include `perfMetrics`/`perfSummary` in the
-result, and stop it in `finally`.
+type (`sample` or `preview`), supported `devices`, and runner method. Add
+`variants` (id -> `{ label, devices?, ... }`) with a `defaultVariant` (an id, or
+`{ default, npu }` per device) when the sample offers several models or data
+types; set `optIn: true` to exclude it from default runs and `timeoutMs` for long
+downloads. Implement the method in the same class: it receives `(results,
+caseDef, variant)` where `caseDef.name` already includes the variant label.
+Select the requested device explicitly, drive the sample's normal UI, verify
+actual output, and append the standard result object (`testName`, `testUrl`,
+`result`, `details`, `subcases`, `suite: 'model'`). Throw on failure;
+`runModelTests` records the error. Use the shared helpers (`openSample`,
+`selectSampleDevice`, `waitForSampleResult`, `installCanvasCapture`,
+`imageStats`, `watchConsoleErrors`, `checkPerf`) and keep output validators as
+pure exported functions. For instrumented previews, start a `WebNNPerfCollector`
+before navigation, include `perfMetrics`/`perfSummary` in the result, and stop it
+in `finally`.
 
 The case is automatically included in `--suite model`, `--model-case`, `--list`,
 and reports; no separate Playwright project is needed. Add focused regression
@@ -240,7 +308,7 @@ node src/main.js --suite wpt --skip-retry
 
 ## Timeouts
 
-Model cases run under a per-case watchdog (default 600 seconds) that aborts the case and restarts the browser if it hangs. WPT test files have a separate per-test limit (default 60 seconds). Override either in seconds:
+Model cases run under a per-case watchdog that aborts the case and restarts the browser if it hangs: 600 seconds by default, and 30 to 90 minutes for previews that download multi-GB models (text generation, SDXL, Stable Diffusion 1.5, SD-Turbo, Z-Image-Turbo). `--model-timeout` replaces the watchdog for every model case. WPT test files have a separate per-test limit (default 60 seconds). Override either in seconds:
 
 ```bash
 # Allow slow model cases up to 30 minutes each

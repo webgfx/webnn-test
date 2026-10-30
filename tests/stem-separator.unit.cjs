@@ -64,17 +64,20 @@ test('stem mix check normalizes MAE by the summed stem level', () => {
 });
 
 test('Stem Separator skips WebNN CPU rather than falling back to WASM', async () => {
-    const previous = process.env.DEVICE;
+    const previous = { DEVICE: process.env.DEVICE, MODEL_CASE: process.env.MODEL_CASE };
     process.env.DEVICE = 'cpu';
+    process.env.MODEL_CASE = 'stem';
     try {
+        // A skipped case never touches the page.
         const runner = new ModelRunner(null);
-        const results = [];
-        await runner.runModelStemSeparator(results, runner.models.stem);
+        const results = await runner.runModelTests();
         assert.equal(results.length, 1);
         assert.equal(results[0].result, 'SKIP');
         assert.deepEqual(results[0].subcases, { total: 0, passed: 0, failed: 0 });
     } finally {
-        if (previous === undefined) delete process.env.DEVICE;
-        else process.env.DEVICE = previous;
+        for (const [key, value] of Object.entries(previous)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
     }
 });

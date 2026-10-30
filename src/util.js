@@ -6,6 +6,24 @@ const os = require('os');
 const { chromium } = require('@playwright/test');
 const { getRuntimeInfo, runtimeInfoRows } = require('./runtime-info');
 
+// Report fields can contain text from the tested pages (model output, transcriptions, error
+// messages), so escape them before writing HTML.
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[char]));
+}
+
+// Only http(s) URLs become links; anything else (e.g. javascript:) links nowhere.
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '#';
+  } catch (e) {
+    return '#';
+  }
+}
+
 // Kill only browser processes that belong to our automation.
 // Uses the browser root PID (captured at launch) to kill the entire process tree,
 // without affecting the user's personal browser windows.
@@ -889,9 +907,6 @@ class WebNNRunner {
         </div>`;
     }
 
-    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, char => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[char]));
     const runtimeRows = runtimeInfoRows(runtimeInfo || getRuntimeInfo(dllCheckResults));
     deviceInfoHtml += `
         <div style="background-color: #e0f7fa; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #80deea;">
@@ -1102,9 +1117,9 @@ class WebNNRunner {
                     <tbody>
                         ${allRegressions.map(t => `
                         <tr>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${escapeHtml(t.name)}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
                             <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${escapeHtml(t.prev)}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
                             <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
                         </tr>`).join('')}
                     </tbody>
@@ -1126,9 +1141,9 @@ class WebNNRunner {
                     <tbody>
                         ${allImprovements.map(t => `
                         <tr>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${escapeHtml(t.name)}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
                             <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${escapeHtml(t.prev)}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
                             <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
                         </tr>`).join('')}
                     </tbody>
@@ -1225,6 +1240,7 @@ class WebNNRunner {
             const argsStr = uniqueConfigValues('browserArgs');
             const wptCaseStr = uniqueConfigValues('wptCase');
             const modelCaseStr = uniqueConfigValues('modelCase');
+            const modelVariantsStr = uniqueConfigValues('modelVariants');
 
             // Derive the signature from the first result (assuming config group maps to one signature)
             // Or if multiple, display primary one
@@ -1306,7 +1322,7 @@ class WebNNRunner {
                     <div style="margin-bottom: 10px; padding: 10px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 6px;">
                         <strong style="color: #dc3545;">▼ Regressions (${groupRegressions}):</strong>
                         <ul style="margin: 5px 0 0 0; padding-left: 20px; font-size: 13px; color: #24292e; max-height: 150px; overflow-y: auto;">
-                            ${regressionTests.map(t => `<li><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${t.prev} &#8594; ${t.result})`}</span></li>`).join('')}
+                            ${regressionTests.map(t => `<li><strong>${escapeHtml(t.name)}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${escapeHtml(t.prev)} &#8594; ${escapeHtml(t.result)})`}</span></li>`).join('')}
                         </ul>
                     </div>`;
                 }
@@ -1315,7 +1331,7 @@ class WebNNRunner {
                     <div style="margin-bottom: 10px; padding: 10px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 6px;">
                         <strong style="color: #28a745;">▲ Improvements (${groupImprovements}):</strong>
                         <ul style="margin: 5px 0 0 0; padding-left: 20px; font-size: 13px; color: #24292e; max-height: 150px; overflow-y: auto;">
-                            ${improvementTests.map(t => `<li><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${t.prev} &#8594; ${t.result})`}</span></li>`).join('')}
+                            ${improvementTests.map(t => `<li><strong>${escapeHtml(t.name)}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''} <span style="color: #666; font-size: 0.9em;">${t.subcaseInfo ? `(${t.subcaseInfo})` : `(${escapeHtml(t.prev)} &#8594; ${escapeHtml(t.result)})`}</span></li>`).join('')}
                         </ul>
                     </div>`;
                 }
@@ -1331,6 +1347,7 @@ class WebNNRunner {
                     ${argsStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Browser Args:</div><div style="font-family: monospace; background-color: #fafbfc; padding: 2px 4px; border-radius: 3px;">${argsStr}</div>` : ''}
                     ${wptCaseStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">WPT Case:</div><div>${wptCaseStr}</div>` : ''}
                      ${modelCaseStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Model Case:</div><div>${modelCaseStr}</div>` : ''}
+                     ${suiteStr.includes('model') && modelVariantsStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Model Variants:</div><div>${modelVariantsStr}</div>` : ''}
                 </div>
             </div>`;
 
@@ -1422,9 +1439,9 @@ class WebNNRunner {
                                         <div style="margin-top: 5px; padding: 10px; background-color: #fff5f5; border-radius: 4px; border: 1px solid #f5c6cb; max-height: 400px; overflow-y: auto;">
                                             ${result.failedSubtests.map((subtest, idx) => `
                                                 <div style="margin: 8px 0; padding: 8px; background-color: #fff; border-left: 3px solid #dc3545; border-radius: 2px;">
-                                                    <div style="font-size: 12px; font-weight: bold; color: #24292e; word-break: break-word;">${idx + 1}. ${subtest.name}</div>
-                                                    ${subtest.status && subtest.status !== 'FAIL' ? `<div style="font-size: 11px; color: #fd7e14; margin-top: 2px;">Status: ${subtest.status}</div>` : ''}
-                                                    ${subtest.message ? `<div style="font-size: 11px; color: #586069; margin-top: 4px; font-family: monospace; white-space: pre-wrap; word-break: break-word; background-color: #f6f8fa; padding: 4px; border-radius: 2px;">${subtest.message}</div>` : ''}
+                                                    <div style="font-size: 12px; font-weight: bold; color: #24292e; word-break: break-word;">${idx + 1}. ${escapeHtml(subtest.name)}</div>
+                                                    ${subtest.status && subtest.status !== 'FAIL' ? `<div style="font-size: 11px; color: #fd7e14; margin-top: 2px;">Status: ${escapeHtml(subtest.status)}</div>` : ''}
+                                                    ${subtest.message ? `<div style="font-size: 11px; color: #586069; margin-top: 4px; font-family: monospace; white-space: pre-wrap; word-break: break-word; background-color: #f6f8fa; padding: 4px; border-radius: 2px;">${escapeHtml(subtest.message)}</div>` : ''}
                                                 </div>
                                             `).join('')}
                                         </div>
@@ -1436,10 +1453,10 @@ class WebNNRunner {
                                 <td style="${baseTdStyle}"><strong>${(result.device || 'N/A').toUpperCase()}</strong></td>
                                 <td style="${baseTdStyle}"><strong>${(result.suite || 'N/A').toUpperCase()}</strong></td>
                                 <td style="${baseTdStyle}">
-                                    <strong>${result.testName}</strong>
-                                    ${result.testUrl ? `<br><small><a href="${result.testUrl}" target="_blank" style="color: #0366d6;">${result.testUrl}</a></small>` : ''}
-                                    ${result.details && !result.details.includes('Exception') ? `<br><div style="margin-top:4px; font-size: 0.9em; color: #24292e; background-color: #e6ffed; padding: 5px; border-left: 3px solid #28a745; border-radius: 2px;">${result.details}</div>` : ''}
-                                    ${result.fullText && result.hasErrors ? `<br><div style="margin-top:4px; font-size: 0.9em; color: #a00; background-color: #fff0f0; padding: 5px; border-left: 3px solid #a00; border-radius: 2px;">${result.fullText}</div>` : ''}
+                                    <strong>${escapeHtml(result.testName)}</strong>
+                                    ${result.testUrl ? `<br><small><a href="${escapeHtml(safeHttpUrl(result.testUrl))}" target="_blank" style="color: #0366d6;">${escapeHtml(result.testUrl)}</a></small>` : ''}
+                                    ${result.details && !result.details.includes('Exception') ? `<br><div style="margin-top:4px; font-size: 0.9em; color: #24292e; background-color: #e6ffed; padding: 5px; border-left: 3px solid #28a745; border-radius: 2px;">${escapeHtml(result.details)}</div>` : ''}
+                                    ${result.fullText && result.hasErrors ? `<br><div style="margin-top:4px; font-size: 0.9em; color: #a00; background-color: #fff0f0; padding: 5px; border-left: 3px solid #a00; border-radius: 2px;">${escapeHtml(result.fullText)}</div>` : ''}
                                     ${failedSubtestsHtml}
                                     ${result.retryHistory && result.retryHistory.length > 1 ? `
                                     <br><details style="margin-top: 5px;">
@@ -1485,15 +1502,15 @@ class WebNNRunner {
                                                         const avg = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length).toFixed(1) : 'N/A';
                                                         const models = [...new Set(data.map(d => d.model).filter(Boolean))];
                                                         const notes = durations.length + ' calls, avg ' + avg + 'ms' + (models.length > 0 ? ' (' + models.join(', ') + ')' : '');
-                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + phase + '</td>';
+                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + escapeHtml(phase) + '</td>';
                                                         rows += '<td style="border:1px solid #ddd;padding:4px 8px;text-align:right;">' + avg + '</td>';
-                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + notes + '</td></tr>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + escapeHtml(notes) + '</td></tr>';
                                                     } else {
                                                         const dur = typeof data.durationMs === 'number' ? data.durationMs.toFixed(1) : 'N/A';
                                                         const notes = data.model ? data.model : '';
-                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + phase + '</td>';
+                                                        rows += '<tr><td style="border:1px solid #ddd;padding:4px 8px;">' + escapeHtml(phase) + '</td>';
                                                         rows += '<td style="border:1px solid #ddd;padding:4px 8px;text-align:right;">' + dur + '</td>';
-                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + notes + '</td></tr>';
+                                                        rows += '<td style="border:1px solid #ddd;padding:4px 8px;color:#586069;">' + escapeHtml(notes) + '</td></tr>';
                                                     }
                                                 }
                                                 return rows;
@@ -1547,7 +1564,7 @@ class WebNNRunner {
 
               return `
                 <tr>
-                    <td style="${baseTdStyle}"><strong>${result.testName}</strong></td>
+                    <td style="${baseTdStyle}"><strong>${escapeHtml(result.testName)}</strong></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(initial.status)};">${initial.status}<br><small style="font-weight: normal; color: #586069;">(${initial.passed}/${initial.total} passed)</small></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(final.status)};">${final.status}<br><small style="font-weight: normal; color: #586069;">(${final.passed}/${final.total} passed)</small></td>
                     <td style="${baseTdStyle}">${retryCount}</td>
@@ -1626,7 +1643,7 @@ class WebNNRunner {
         <tbody>
             ${results.map(result => `
                 <tr>
-                    <td>${result.testName}</td>
+                    <td>${escapeHtml(result.testName)}</td>
                     <td>${result.subcases.total}</td>
                     <td class="pass">${result.subcases.passed}</td>
                     <td class="fail">${result.subcases.failed}</td>
@@ -1842,4 +1859,4 @@ class WebNNPerfCollector {
   }
 }
 
-module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info, escapeHtml, safeHttpUrl };
