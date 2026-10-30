@@ -848,6 +848,8 @@ class ModelRunner extends WebNNRunner {
       try {
         await this.runTestWithSessionCheck(async () => {
              const casePage = this.page;
+             const caseRunner = Object.create(this);
+             caseRunner.page = casePage;
              // Setup console listener for infinity checks (common in preview)
              const consoleListener = async (msg) => {
                 if (msg.type() === 'error') remember(`Console: ${msg.text()}`);
@@ -873,8 +875,17 @@ class ModelRunner extends WebNNRunner {
                 casePage.off('requestfailed', requestFailedListener);
                 casePage.off('response', responseListener);
              };
-             await caseDef.func.call(this, caseResults, caseDef, caseDef.variant);
+             await caseDef.func.call(caseRunner, caseResults, caseDef, caseDef.variant);
         }, true, { timeoutMs });
+        for (const result of caseResults) {
+          if (!['PASS', 'SKIP'].includes(result.result) || result.hasErrors || result.subcases?.failed > 0) {
+            result.fullText = [
+              result.fullText || result.details || `Model case returned ${result.result}`,
+              ...diagnostics
+            ].join('\n');
+            result.hasErrors = true;
+          }
+        }
         results.push(...caseResults);
       } catch (error) {
         if (infinityErrorDetected) {
