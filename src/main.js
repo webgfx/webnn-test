@@ -8,7 +8,7 @@ const { test, expect, chromium } = require('@playwright/test');
 
 const { WptRunner, getWptConformanceUrl, getWptTimeoutMs } = require('./wpt');
 const { ModelRunner } = require('./model');
-const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
+const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info, formatTextResult, assertTestResults } = require('./util');
 const { getRuntimeInfo, runtimeInfoRows, resolveWindowsAppSdk, verifyWindowsAppSdk } = require('./runtime-info');
 
 // Helper to parse comma-separated lists
@@ -380,7 +380,7 @@ Examples:
           const childProcess = spawn(process.execPath, [playwrightCli, ...playwrightArgs], {
              stdio: 'inherit',
              shell: false,
-             env: { ...process.env, IS_PLAYWRIGHT_CHILD_PROCESS: 'true' }
+             env: { ...process.env, IS_PLAYWRIGHT_CHILD_PROCESS: 'true', PLAYWRIGHT_HTML_OPEN: process.env.PLAYWRIGHT_HTML_OPEN || 'never' }
           });
 
           childProcess.on('close', (code) => {
@@ -742,6 +742,7 @@ Examples:
                                for (const line of lines) {
                                    const trimmed = line.trim();
                                    if (!trimmed) continue;
+                                   if (/^\s/.test(line) && !line.startsWith('  - ')) continue;
                                    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
                                        currentKey = trimmed.slice(1, -1);
                                        baselineData[currentKey] = {};
@@ -848,23 +849,7 @@ Examples:
                        for (const [key, groupResults] of Object.entries(groups)) {
                            allTextContent += `\n[${key}]\n`;
 
-                           const content = groupResults.map(r => {
-                               let line = `${r.testName}: ${r.result}`;
-                               // Append subcase counts if available
-                               if (r.subcases && r.subcases.total > 0) {
-                                   line += ` [${r.subcases.passed}/${r.subcases.total}]`;
-                               }
-                               // Append WebNN perf metrics summary if available
-                               if (r.perfSummary) {
-                                   line += `\n  perf: ${r.perfSummary}`;
-                               }
-                               // Append detailed failure messages for WPT if available
-                               if (r.failedSubtests && r.failedSubtests.length > 0) {
-                                   const subtestDetails = r.failedSubtests.map(s => `  - ${s.name}: ${s.status}`).join('\n');
-                                   line += `\n${subtestDetails}`;
-                               }
-                               return line;
-                           }).join('\n');
+                           const content = groupResults.map(formatTextResult).join('\n');
 
                            allTextContent += content + '\n';
                        }
@@ -884,6 +869,7 @@ Examples:
                        await runner.sendEmailReport(process.env.EMAIL_TO, suiteNames, results, wallTime, sumOfTestTimes, null, report);
                    }
               }
+              assertTestResults(results);
           });
       }
   });

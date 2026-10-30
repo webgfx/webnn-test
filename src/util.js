@@ -24,6 +24,29 @@ function safeHttpUrl(value) {
   }
 }
 
+function formatTextResult(result) {
+    let text = `${result.testName}: ${result.result}`;
+    if (result.subcases && result.subcases.total > 0) {
+        text += ` [${result.subcases.passed}/${result.subcases.total}]`;
+    }
+    const details = result.fullText || result.details;
+    if (details) text += `\n  details: ${String(details).replace(/\r?\n/g, '\n    ')}`;
+    if (result.perfSummary) text += `\n  perf: ${result.perfSummary}`;
+    for (const subtest of result.failedSubtests || []) {
+        text += `\n  - ${subtest.name}: ${subtest.status}`;
+    }
+    return text;
+}
+
+function assertTestResults(results) {
+    const failures = results.filter(result =>
+        !['PASS', 'SKIP'].includes(result.result) ||
+        result.hasErrors || result.subcases?.failed > 0);
+    if (failures.length) {
+        throw new Error(`${failures.length} test case(s) failed:\n${failures.map(formatTextResult).join('\n')}`);
+    }
+}
+
 // Kill only browser processes that belong to our automation.
 // Uses the browser root PID (captured at launch) to kill the entire process tree,
 // without affecting the user's personal browser windows.
@@ -505,7 +528,7 @@ class WebNNRunner {
     const hardTimeoutPromise = new Promise((_, reject) => {
       hardTimer = setTimeout(() => {
         hardTimedOut = true;
-        reject(new Error(`Test hard timeout (${timeoutMs/1000}s) - GPU process may have crashed`));
+        reject(new Error(`Test hard timeout (${timeoutMs/1000}s) - case did not finish`));
       }, timeoutMs);
     });
 
@@ -522,18 +545,19 @@ class WebNNRunner {
       // errors like "Target page, context or browser has been closed" or
       // "Target closed" or "Protocol error ... Target closed".
       const msg = error.message || '';
-      const isCrash = hardTimedOut ||
-                      msg.includes('Target page, context or browser has been closed') ||
+      const isCrash = msg.includes('Target page, context or browser has been closed') ||
                       msg.includes('Target closed') ||
                       msg.includes('browser has been closed') ||
                       msg.includes('Protocol error') ||
                       msg.includes('Connection closed');
-      if (isCrash && !sessionInitFailed) {
+      if (hardTimedOut) {
+        console.error(`[Fail] [Test Timeout] ${msg}`);
+      } else if (isCrash && !sessionInitFailed) {
         browserCrashed = true;
         console.error(`[Fail] [Browser Crash] Browser process died during test. Error: ${msg}`);
       }
 
-      if (sessionInitFailed || browserCrashed) {
+      if (sessionInitFailed || browserCrashed || hardTimedOut) {
         console.log('[Info] Handling browser failure recovery...');
         if (shouldRestart) {
           try {
@@ -551,6 +575,7 @@ class WebNNRunner {
         if (sessionInitFailed) {
           throw new Error(`Failed to create session: ${sessionFailureMessage}`);
         }
+        if (hardTimedOut) throw error;
         throw new Error(`Browser crashed: ${msg}`);
       }
       throw error;
@@ -1859,4 +1884,4 @@ class WebNNPerfCollector {
   }
 }
 
-module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info, escapeHtml, safeHttpUrl };
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info, escapeHtml, safeHttpUrl, formatTextResult, assertTestResults };

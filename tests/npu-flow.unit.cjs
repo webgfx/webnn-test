@@ -1,6 +1,33 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { ModelRunner, expandModelCases } = require('../src/model');
+const { WebNNRunner } = require('../src/util');
+const { EventEmitter } = require('node:events');
+
+test('a watchdog timeout recovers for the next case without claiming a GPU crash', async () => {
+    const makePage = () => Object.assign(new EventEmitter(), {
+        isClosed: () => false,
+        context: () => ({ browser: () => null })
+    });
+    const page = makePage();
+    const runner = new WebNNRunner(page);
+    let restarts = 0;
+    runner.restartBrowserAndContext = async () => {
+        restarts++;
+        return { page: makePage() };
+    };
+    await assert.rejects(runner.runTestWithSessionCheck(() => new Promise(() => {}), true, { timeoutMs: 20 }),
+        { message: 'Test hard timeout (0.02s) - case did not finish' });
+    assert.equal(restarts, 1);
+    assert.notEqual(runner.page, page);
+    assert.equal(page.listenerCount('console'), 0);
+    assert.equal(page.listenerCount('pageerror'), 0);
+    let completed = false;
+    await runner.runTestWithSessionCheck(async () => { completed = true; });
+    assert.equal(completed, true);
+    assert.equal(runner.page.listenerCount('console'), 0);
+    assert.equal(runner.page.listenerCount('pageerror'), 0);
+});
 
 // A fake page that mimics the webnn-samples image_classification UI on a WebNN NPU device:
 // selecting NPU disables float32 and re-selects float16 asynchronously (as upstream's device handler

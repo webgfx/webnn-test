@@ -1,5 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const {
     ModelRunner,
     parseModelCaseFilter,
@@ -88,7 +89,10 @@ test('a failing case is reported even after a passing case with the same name', 
         runner.ensurePage = async () => {};
         runner.runTestWithSessionCheck = async (fn, restart, options) => { timeouts.push(options.timeoutMs); await fn(); };
         const pass = (results, caseDef) => { results.push({ testName: caseDef.name, result: 'PASS', subcases: { total: 1, passed: 1, failed: 0 } }); };
-        const fail = async () => { throw new Error('boom'); };
+        const fail = async (results, caseDef) => {
+            pass(results, caseDef);
+            throw new Error('boom');
+        };
         runner.models = {
             one: { name: 'Same', url: 'u', type: 'sample', timeoutMs: 60000, func: pass },
             two: { name: 'Same', url: 'u', type: 'sample', func: fail }
@@ -106,6 +110,50 @@ test('a failing case is reported even after a passing case with the same name', 
     }
 });
 
+test('a timed-out case cannot append late results or retain diagnostic listeners', async () => {
+    const previous = { DEVICE: process.env.DEVICE, MODEL_CASE: process.env.MODEL_CASE };
+    process.env.DEVICE = 'npu';
+    process.env.MODEL_CASE = 'slow,working';
+    try {
+        const page = Object.assign(new EventEmitter(), { isClosed: () => true });
+        const runner = new ModelRunner(page);
+        runner.ensurePage = async () => {};
+        let finishSlowCase;
+        let slowTask;
+        runner.runTestWithSessionCheck = async fn => {
+            if (!slowTask) {
+                slowTask = fn();
+                throw new Error('Test hard timeout');
+            }
+            await fn();
+        };
+        runner.models = {
+            slow: { name: 'Slow', url: 'u', type: 'preview', func: async results => {
+                await new Promise(resolve => { finishSlowCase = resolve; });
+                results.push({ testName: 'Late success', result: 'PASS' });
+            } },
+            working: { name: 'Working', url: 'u', type: 'preview', func: async results => {
+                assert.equal(page.listenerCount('response'), 1, 'only the active case is listening');
+                finishSlowCase();
+                await slowTask;
+                results.push({ testName: 'Working', result: 'PASS' });
+            } }
+        };
+        const results = await runner.runModelTests();
+        assert.deepEqual(results.map(result => [result.testName, result.result]), [
+            ['Slow', 'ERROR'], ['Working', 'PASS']
+        ]);
+        for (const event of ['console', 'pageerror', 'requestfailed', 'response']) {
+            assert.equal(page.listenerCount(event), 0);
+        }
+    } finally {
+        for (const [key, value] of Object.entries(previous)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
 test('expanded items carry a per-variant test name and the variant definition', () => {
     const [item] = expandModelCases(models, { filter: 'multi:b', device: 'cpu' });
     assert.equal(item.caseDef.name, 'Multi [B]');
@@ -113,6 +161,49 @@ test('expanded items carry a per-variant test name and the variant definition', 
     assert.equal(item.caseDef.variant.label, 'B');
     assert.equal(item.skipReason, null);
     assert.match(expandModelCases(models, { filter: 'multi:a', device: 'npu' })[0].skipReason, /No WebNN NPU support in this variant \(supported: cpu, gpu\)/);
+});
+
+test('model failures keep bounded browser and network diagnostics without leaking into later cases', async () => {
+    const previous = { DEVICE: process.env.DEVICE, MODEL_CASE: process.env.MODEL_CASE };
+    process.env.DEVICE = 'npu';
+    process.env.MODEL_CASE = 'broken,working';
+    try {
+        const page = Object.assign(new EventEmitter(), { isClosed: () => true });
+        const runner = new ModelRunner(page);
+        runner.ensurePage = async () => {};
+        runner.runTestWithSessionCheck = async fn => fn();
+        runner.models = {
+            broken: { name: 'Broken', url: 'u', type: 'preview', func: async () => {
+                for (let i = 0; i < 15; i++) {
+                    page.emit('console', { type: () => 'error', text: () => `message ${i} ${'x'.repeat(2000)}` });
+                }
+                page.emit('response', { status: () => 404, url: () => 'https://example.com/model.onnx' });
+                page.emit('requestfailed', { url: () => 'https://example.com/weights', failure: () => ({ errorText: 'net::ERR_FAILED' }) });
+                page.emit('pageerror', new Error('device lost'));
+                throw new Error('Load timed out');
+            } },
+            working: { name: 'Working', url: 'u', type: 'preview', func: async (results, caseDef) => {
+                results.push({ testName: caseDef.name, result: 'PASS' });
+            } }
+        };
+        const results = await runner.runModelTests();
+        assert.deepEqual(results.map(result => result.result), ['ERROR', 'PASS']);
+        assert.match(results[0].fullText, /Load timed out\n/);
+        assert.match(results[0].fullText, /HTTP 404: https:\/\/example.com\/model.onnx/);
+        assert.match(results[0].fullText, /Request failed: .*net::ERR_FAILED/);
+        assert.match(results[0].fullText, /Page error: device lost/);
+        assert.ok(!results[0].fullText.includes('message 0 '));
+        assert.ok(results[0].fullText.length <= 11000);
+        assert.equal(results[1].fullText, undefined);
+        for (const event of ['console', 'pageerror', 'requestfailed', 'response']) {
+            assert.equal(page.listenerCount(event), 0);
+        }
+    } finally {
+        for (const [key, value] of Object.entries(previous)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
 });
 
 test('registered model cases have valid devices and default variants', () => {
