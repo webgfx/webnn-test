@@ -28,12 +28,15 @@ class Locator {
 }
 
 // A fake SDXL Turbo page. The 'new' layout shows each image's result in #data1-#data4, 'old' shows the
-// total in #total_data, and 'none' shows neither. Canvases listed in `blank` screenshot as blank.
+// total in #total_data, and 'none' shows neither. Canvases listed in `blank` screenshot as blank. With
+// `failAt`, generating that image (0-based) fails the way the demo does: it logs an [Error] line to #log
+// and leaves Generate Image disabled.
 function fakeSdxlPage({
     layout = 'new',
     placeholder = '... ms',
     outputs = ['1234.5ms', '1240.25ms', '1251ms', '1262.75ms'],
-    blank = []
+    blank = [],
+    failAt = null
 } = {}) {
     const page = new EventEmitter();
     const elements = { log: { innerText: '' } };
@@ -59,6 +62,10 @@ function fakeSdxlPage({
         if (elements.total_data) elements.total_data.textContent = '...';
         for (let j = 0; j < 4; j++) {
             await delay(5);
+            if (j === failAt) {
+                elements.log.innerText += "\n[Error] Error: Failed to execute 'readTensor' on 'MLContext'";
+                return;
+            }
             emitPerf('webnn.inference');
             if (elements[`data${j + 1}`]) elements[`data${j + 1}`].textContent = outputs[j];
         }
@@ -157,6 +164,13 @@ test('SDXL fails at the poll deadline instead of hanging when no result element 
     await assert.rejects(runSdxl(fakeSdxlPage({ layout: 'none' }), { pollTimeout: 200 }), {
         message: new RegExp('^Generation did not complete: #data1-#data4 / #total_data not populated ' +
             '\\(#data1-#data4: missing, missing, missing, missing; #total_data: missing; Generate Image (enabled|disabled)\\)$')
+    });
+});
+
+test('SDXL fails fast with the logged error when generation throws and Generate Image stays disabled', { timeout: 10000 }, async () => {
+    // Without the #log check the poll would run to its (capped) deadline and report "did not complete".
+    await assert.rejects(runSdxl(fakeSdxlPage({ failAt: 1 }), { pollTimeout: 5000 }), {
+        message: "Generation failed: [Error] Error: Failed to execute 'readTensor' on 'MLContext'"
     });
 });
 

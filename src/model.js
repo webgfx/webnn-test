@@ -1555,12 +1555,18 @@ class ModelRunner extends WebNNRunner {
 
       // Done once Generate Image is enabled again and every image shows its result (#data1-#data4, one per
       // image, on the current demo; #total_data on older ones). A " · NSFW" suffix is still a result.
+      // A failed run logs "[Error] ..." to #log and leaves Generate Image disabled, so check the log each tick.
+      const generationError = async () => {
+        errors.check('Generation');
+        const lines = await this.previewLogErrors();
+        if (lines.length) throw new Error(`Generation failed: ${lines.join(' | ')}`);
+      };
       let lastResults = null;
       const summary = await this.pollUntil(async () => {
         const state = await this.page.evaluate(readSdxlResultsInPage).catch(() => null);
         if (state) lastResults = state;
         return sdxlCompletion(state);
-      }, { timeout: 10 * MINUTE, onTick: () => errors.check('Generation') });
+      }, { timeout: 10 * MINUTE, onTick: generationError });
       if (!summary) {
         throw new Error(`Generation did not complete: #data1-#data4 / #total_data not populated (${describeSdxlResults(lastResults)})`);
       }
