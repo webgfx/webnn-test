@@ -384,6 +384,37 @@ function checkDenoisedAudio(original, denoised, { minRmsRatio = 0.2, maxRmsRatio
   return { ratio, correlation };
 }
 
+// Summarizes a finished SDXL Turbo run from a readSdxlResultsInPage snapshot, or returns null while it runs.
+// Generate Image is enabled again at the end. Each #dataN shows "..." while its image runs, then "<ms>ms"
+// (or just the image number without timing) plus " · NSFW" if flagged; older pages had one #total_data.
+function sdxlCompletion(state) {
+  if (!state || !state.generateEnabled) return null;
+  const { images, total } = state;
+  if (images.every(text => text && !text.startsWith('...'))) {
+    const times = images.map(text => (/^(\d+(?:\.\d+)?)\s*ms\b/.exec(text) || [])[1]);
+    const flagged = images.map((text, i) => (text.includes('NSFW') ? i + 1 : 0)).filter(Boolean);
+    const summary = times.every(Boolean) ? `Image totals: ${times.map(t => `${t}ms`).join(', ')}` : 'Per-image times not shown';
+    return flagged.length ? `${summary}. Safety checker flagged image ${flagged.join(', ')}` : summary;
+  }
+  if (total && total !== '...' && /\d/.test(total)) return `Total time: ${total}`;
+  return null;
+}
+
+function describeSdxlResults(state) {
+  if (!state) return 'page not readable';
+  const show = text => (text === null ? 'missing' : JSON.stringify(text));
+  return `#data1-#data4: ${state.images.map(show).join(', ')}; #total_data: ${show(state.total)}; ` +
+    `Generate Image ${state.generateEnabled ? 'enabled' : 'disabled'}`;
+}
+
+// Resolves with the promise's value, or with null once the deadline passes, so a call that never settles
+// (such as a Playwright read waiting for a missing element) cannot outlive a poll. A late rejection is ignored.
+function settleBy(promise, deadline) {
+  let timer;
+  const expired = new Promise(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now()), null); });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Verifies [WebNN:Perf] entries prove the work ran on WebNN with the requested device, so a
  * silent fallback to WASM/WebGPU fails. Requirements are names or { name, model, min }.
@@ -514,6 +545,21 @@ function readSampleStateInPage() {
     return `${input.id}:${input.checked ? 1 : 0}${disabled ? 'd' : ''}${label.offsetParent ? 'v' : 'h'}`;
   }).join(',');
   return { pending: window.__webnnPendingContexts || 0, controls };
+}
+
+// The SDXL Turbo result texts (null when the element is missing) and whether Generate Image is enabled.
+function readSdxlResultsInPage() {
+  const text = selector => {
+    const element = document.querySelector(selector);
+    return element ? (element.textContent || '').trim() : null;
+  };
+  const generate = Array.from(document.querySelectorAll('button'))
+    .find(button => /generate image/i.test(button.textContent || ''));
+  return {
+    images: [1, 2, 3, 4].map(i => text(`#data${i}`)),
+    total: text('#total_data'),
+    generateEnabled: Boolean(generate && !generate.disabled)
+  };
 }
 
 // Records 2D canvas annotations per canvas id. A drawImage starts a new frame, so only the
@@ -1126,12 +1172,20 @@ class ModelRunner extends WebNNRunner {
       .split('\n').filter(line => line.includes('[Error]') || line.includes('failed, ')));
   }
 
-  // Polls fn until it returns a truthy value; onTick may throw to abort early.
+  // Reads an element's text through page.evaluate, which unlike locator reads does not wait for the
+  // element: a missing element reads as '' at once, so polling deadlines hold if a demo drops it.
+  async readText(selector, property = 'textContent') {
+    return this.page.evaluate(([sel, prop]) => document.querySelector(sel)?.[prop] ?? '', [selector, property])
+      .then(text => text || '', () => '');
+  }
+
+  // Polls fn until it returns a truthy value; onTick may throw to abort early. A call to fn still
+  // pending at the deadline is abandoned, so the poll returns null on time.
   async pollUntil(fn, { timeout, interval = 500, onTick = null }) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       if (onTick) await onTick();
-      const value = await fn();
+      const value = await settleBy(fn(), deadline);
       if (value) return value;
       await this.page.waitForTimeout(interval);
     }
@@ -1499,11 +1553,17 @@ class ModelRunner extends WebNNRunner {
       console.log('[Success] Models loaded. Clicking Generate Image...');
       await generateButton.click();
 
-      const totalTime = await this.pollUntil(async () => {
-        const text = ((await this.page.locator('#total_data').textContent().catch(() => '')) || '').trim();
-        return text && text !== '...' && /\d/.test(text) ? text : null;
+      // Done once Generate Image is enabled again and every image shows its result (#data1-#data4, one per
+      // image, on the current demo; #total_data on older ones). A " · NSFW" suffix is still a result.
+      let lastResults = null;
+      const summary = await this.pollUntil(async () => {
+        const state = await this.page.evaluate(readSdxlResultsInPage).catch(() => null);
+        if (state) lastResults = state;
+        return sdxlCompletion(state);
       }, { timeout: 10 * MINUTE, onTick: () => errors.check('Generation') });
-      if (!totalTime) throw new Error('Result text did not appear or invalid');
+      if (!summary) {
+        throw new Error(`Generation did not complete: #data1-#data4 / #total_data not populated (${describeSdxlResults(lastResults)})`);
+      }
       const runErrors = await this.previewLogErrors();
       if (runErrors.length) throw new Error(`Generation failed: ${runErrors.join(' | ')}`);
 
@@ -1511,7 +1571,7 @@ class ModelRunner extends WebNNRunner {
         checkImageStats(await this.imageStats(`#img_canvas_${i}`), `Image ${i + 1}`);
       }
       const perf = this.checkPerf(perfCollector, device, ['webnn.session.create', 'webnn.inference'], 'SDXL');
-      results.push(passResult(caseDef, testUrl, `Generated 4 images. Total time: ${totalTime}`, perf));
+      results.push(passResult(caseDef, testUrl, `Generated 4 images. ${summary}`, perf));
     } finally {
       errors.dispose();
       perfCollector.stop();
@@ -1613,7 +1673,7 @@ class ModelRunner extends WebNNRunner {
       await this.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 
       const latency = await this.pollUntil(async () => {
-        const text = await this.page.locator('#decoder_latency').innerText().catch(() => '');
+        const text = await this.readText('#decoder_latency', 'innerText');
         return text && /\d/.test(text) && !text.includes('...') ? text : null;
       }, { timeout: MINUTE, onTick: () => errors.check('Inference') });
       if (!latency) throw new Error('Latency not displayed in #decoder_latency');
@@ -1672,10 +1732,10 @@ class ModelRunner extends WebNNRunner {
       console.log('Uploaded WAV file. Waiting for transcription...');
 
       const latencyText = await this.pollUntil(async () => {
-        const text = await this.page.locator('#latency').innerText().catch(() => '');
+        const text = await this.readText('#latency', 'innerText');
         return text && text.includes('100') ? text : null;
       }, { timeout: MINUTE, onTick: () => errors.check('Transcription') });
-      const transcription = await this.page.locator('#outputText').textContent().catch(() => '');
+      const transcription = await this.readText('#outputText');
       console.log(`Transcription result: "${transcription}"`);
       if (!latencyText) throw new Error('Transcription did not complete (latency never reached 100%)');
 
@@ -1784,7 +1844,7 @@ class ModelRunner extends WebNNRunner {
     // The demo shows load and generation exceptions in #error.
     const pageError = async what => {
       errors.check(what);
-      const text = ((await this.page.locator('#error').textContent().catch(() => '')) || '').trim();
+      const text = (await this.readText('#error')).trim();
       if (text) throw new Error(`${what} failed: ${text}`);
     };
     try {
@@ -1806,12 +1866,12 @@ class ModelRunner extends WebNNRunner {
       console.log(`[Success] Models loaded. Generating with seed ${seed}...`);
       await generateButton.click();
       const totalRun = await this.pollUntil(async () => {
-        const text = ((await this.page.locator('#totalrun').textContent().catch(() => '')) || '').trim();
+        const text = (await this.readText('#totalrun')).trim();
         return /^\d+(\.\d+)?$/.test(text) && Number(text) > 0 ? text : null;
       }, { timeout: 15 * MINUTE, interval: 1000, onTick: () => pageError('Generation') });
       if (!totalRun) throw new Error('Generation did not finish (#totalrun stayed empty)');
 
-      const nsfw = ((await this.page.locator('#nsfw').textContent().catch(() => '')) || '').trim();
+      const nsfw = (await this.readText('#nsfw')).trim();
       if (nsfw) throw new Error(`Safety checker flagged the default prompt: ${nsfw}`);
       checkImageStats(await this.imageStats('#canvas'), 'Generated image');
       // A fixed 25-step schedule: the UNet must run 25 times on WebNN.
