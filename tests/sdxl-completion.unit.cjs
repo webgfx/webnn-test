@@ -191,3 +191,23 @@ test('pollUntil returns null at its deadline even if a call never settles', { ti
     assert.equal(await runner.pollUntil(() => new Promise(() => {}), { timeout: 50 }), null);
     assert.ok(Date.now() - start < 1000, `took ${Date.now() - start}ms`);
 });
+
+test('pollUntil abandons an onTick that never settles and does not start another', { timeout: 10000 }, async () => {
+    const runner = new ModelRunner({ waitForTimeout: ms => delay(Math.min(ms, 10)) });
+    let ticks = 0;
+    const start = Date.now();
+    const onTick = () => { ticks++; return new Promise(() => {}); };
+    assert.equal(await runner.pollUntil(() => false, { timeout: 50, onTick }), null);
+    assert.equal(ticks, 1);
+    assert.ok(Date.now() - start < 1000, `took ${Date.now() - start}ms`);
+});
+
+test('pollUntil still reports an error that the onTick after its deadline finds', { timeout: 10000 }, async () => {
+    const runner = new ModelRunner({ waitForTimeout: ms => delay(Math.min(ms, 10)) });
+    let ticks = 0;
+    const onTick = async () => {
+        if (++ticks > 1) throw new Error('Generation failed: [Error] boom');
+    };
+    await assert.rejects(runner.pollUntil(() => new Promise(() => {}), { timeout: 50, onTick }),
+        { message: 'Generation failed: [Error] boom' });
+});

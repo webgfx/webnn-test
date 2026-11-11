@@ -9,6 +9,8 @@ const SAMPLES_URL = 'https://webmachinelearning.github.io/webnn-samples/';
 const PREVIEW_URL = 'https://microsoft.github.io/webnn-developer-preview/demos/';
 const MINUTE = 60000;
 const DEFAULT_CASE_TIMEOUT = 10 * MINUTE;
+// pollUntil runs onTick once more after its deadline to report the error that ended the run; this bounds it.
+const FINAL_TICK_MS = 5000;
 
 // webnn-samples report every error through ui.addAlert(); info alerts are not failures.
 const SAMPLE_ALERT = '#container > .alert:not(.alert-info)';
@@ -1179,17 +1181,25 @@ class ModelRunner extends WebNNRunner {
       .then(text => text || '', () => '');
   }
 
-  // Polls fn until it returns a truthy value; onTick may throw to abort early. A call to fn still
-  // pending at the deadline is abandoned, so the poll returns null on time.
+  // Polls fn until it returns a truthy value; onTick may throw to abort early. onTick, fn and the wait
+  // between calls are abandoned at the deadline, so the poll returns null on time. After the deadline
+  // onTick runs once more, bounded by FINAL_TICK_MS, unless the previous call is still pending.
   async pollUntil(fn, { timeout, interval = 500, onTick = null }) {
     const deadline = Date.now() + timeout;
+    // Resolves true once onTick finishes, or null if it is still running at `until`.
+    const tick = until => settleBy(Promise.resolve(onTick()).then(() => true), until);
+    let tickFinished = true;
     while (Date.now() < deadline) {
-      if (onTick) await onTick();
+      if (onTick) {
+        tickFinished = await tick(deadline);
+        if (Date.now() >= deadline) break;
+      }
       const value = await settleBy(fn(), deadline);
       if (value) return value;
-      await this.page.waitForTimeout(interval);
+      const wait = Math.min(interval, deadline - Date.now());
+      if (wait > 0) await settleBy(this.page.waitForTimeout(wait), deadline);
     }
-    if (onTick) await onTick();
+    if (onTick && tickFinished) await tick(Date.now() + FINAL_TICK_MS);
     return null;
   }
 
